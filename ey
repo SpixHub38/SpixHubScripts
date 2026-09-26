@@ -639,7 +639,9 @@ local function purchaseRoll(id, stateKey)
 	local snapshot = remote:InvokeServer("GetState")
 	local entry = type(snapshot) == "table" and snapshot[stateKey]
 	if type(snapshot) ~= "table" or snapshot.Ready ~= true
-		or type(entry) ~= "table" or entry.IsMaxed or not canAfford(entry.Price) then return end
+		or type(entry) ~= "table" or entry.IsMaxed then return end
+	-- The native upgrade button sends this request without a local balance check.
+	-- Let the server validate the price; a client-side check can block valid purchases.
 	local result = remote:InvokeServer("Purchase", id)
 	assert(result ~= false and (type(result) ~= "table"
 		or result.Ready ~= false and result.Success ~= false),
@@ -711,20 +713,29 @@ local function tryTollUpgrade()
 				local part = toll.PrimaryPart or toll:FindFirstChildWhichIsA("BasePart", true)
 				if not part then return end
 				moveNear(part, 12)
+				local guiName = string.format("TollUpgradeGUI_Line_%02d", lineIndex)
+				local tollGui = playerGui:WaitForChild(guiName, 3)
+				if not tollGui then
+					setStatus(guiName .. " is not available yet.", colors.muted)
+					return
+				end
 				-- Moving can yield; recheck the owner and hierarchy before touching the remote.
 				if ownPlot() ~= plot or plot:GetAttribute("OwnerUserId") ~= player.UserId
 					or not toll:IsDescendantOf(plot) or not part:IsDescendantOf(toll)
+					or tollGui.Parent ~= playerGui or tollGui.Name ~= guiName
 					or not upgradeFlags.Tolls or not alive then return end
+				local guiOwner = tollGui:GetAttribute("OwnerUserId")
+				if guiOwner ~= nil and guiOwner ~= player.UserId then return end
+				if (tollGui:IsA("BillboardGui") or tollGui:IsA("SurfaceGui"))
+					and tollGui.Adornee and not tollGui.Adornee:IsDescendantOf(plot) then return end
 				tollAttempts[toll] = os.clock()
-				remote:FireServer(lineIndex)
+				remote:FireServer(tollGui)
 				task.wait(3)
-				if tonumber(toll:GetAttribute("TollLevel")) ~= level then
+				if tonumber(toll:GetAttribute("TollLevel"))
+					and tonumber(toll:GetAttribute("TollLevel")) > level then
 					setStatus("Toll " .. lineIndex .. " upgraded.", colors.green)
 				else
-					upgradeFlags.Tolls = false
-					upgradeButtons.Tolls.Text = "TOLLS  NEEDS SERVER ACTION"
-					upgradeButtons.Tolls.BackgroundColor3 = colors.surface
-					setStatus("TollUpgradeEvent did not confirm a purchase. Check the game's toll server handler.", colors.red)
+					setStatus("Toll " .. lineIndex .. " unchanged; the server may require more cash or time.", colors.muted)
 				end
 				return
 			end
@@ -743,9 +754,9 @@ task.spawn(function()
 		if upgradeFlags[key] and os.clock() >= (nextAttempt[key] or 0) then
 			nextAttempt[key] = os.clock() + upgradeCooldowns[key]
 			local ok, result = pcall(function()
-				if key == "Traffic" then purchaseLine("Line")
-				elseif key == "Spawn" then purchaseLine("Spawn")
-				elseif key == "Speed" then purchaseLine("Speed")
+				if key == "Traffic" then purchaseLine("LineUpgrade")
+				elseif key == "Spawn" then purchaseLine("SpawnIntervalUpgrade")
+				elseif key == "Speed" then purchaseLine("CarsSpeedUpgrade")
 				elseif key == "Areas" then purchaseRoll("RollStandUpgrade", "Areas")
 				elseif key == "Luck" then purchaseRoll("LuckUpgrade", "Luck")
 				elseif key == "Rebirth" then tryRebirth()
