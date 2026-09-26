@@ -622,7 +622,9 @@ end
 
 local function purchaseLine(id)
 	local remote = endpoint("LineUpgradeRequest", "RemoteFunction")
-	local state = remote:InvokeServer("GetState", id)
+	-- The upgrade board sends the selected quantity for both state and purchase.
+	-- Without the quantity, the server cannot price or validate these upgrades.
+	local state = remote:InvokeServer("GetState", id, 1)
 	if type(state) ~= "table" or state.Ready ~= true or state.IsMaxed
 		or not canAfford(state.Price) then return end
 	local result = remote:InvokeServer("Purchase", id, 1)
@@ -672,31 +674,47 @@ local function tryMapUnlock()
 	setStatus("Next map unlock requested. The game checks all requirements.", colors.green)
 end
 
-local tollTargets, lastTollScan = {}, -math.huge
+local tollTargets, lastTollScan, lastTollPlot = {}, -math.huge, nil
 local function getTollTargets()
-	if os.clock() - lastTollScan < 45 then return tollTargets end
+	local plot = ownPlot()
+	if not plot or plot:GetAttribute("OwnerUserId") ~= player.UserId then
+		lastTollPlot = nil
+		table.clear(tollTargets)
+		return tollTargets, nil
+	end
+	if plot == lastTollPlot and os.clock() - lastTollScan < 45 then
+		return tollTargets, plot
+	end
+	lastTollPlot = plot
 	lastTollScan = os.clock()
 	table.clear(tollTargets)
-	local plot = ownPlot()
-	if plot then
-		for _, object in ipairs(plot:GetDescendants()) do
-			if object:IsA("Model") and object.Name == "ActiveToll"
-				and object:GetAttribute("TollUpgradeRuntime") == true then
-				table.insert(tollTargets, object)
-			end
+	for _, object in ipairs(plot:GetDescendants()) do
+		if object:IsA("Model") and object.Name == "ActiveToll"
+			and object:GetAttribute("TollUpgradeRuntime") == true then
+			table.insert(tollTargets, object)
 		end
 	end
-	return tollTargets
+	return tollTargets, plot
 end
 local tollAttempts = setmetatable({}, {__mode = "k"})
 local function tryTollUpgrade()
 	local remote = endpoint("TollUpgradeEvent", "RemoteEvent")
-	for _, toll in ipairs(getTollTargets()) do
-		if toll.Parent then
+	local targets, plot = getTollTargets()
+	if not plot then return end
+	for _, toll in ipairs(targets) do
+		if toll:IsDescendantOf(plot) and plot:GetAttribute("OwnerUserId") == player.UserId then
 			local lineIndex = tonumber(toll:GetAttribute("LineIndex"))
 			local level = tonumber(toll:GetAttribute("TollLevel"))
-			if lineIndex and level and (not tollAttempts[toll]
+			if lineIndex and lineIndex >= 1 and lineIndex % 1 == 0 and level
+				and (not tollAttempts[toll]
 				or os.clock() - tollAttempts[toll] >= 30) then
+				local part = toll.PrimaryPart or toll:FindFirstChildWhichIsA("BasePart", true)
+				if not part then return end
+				moveNear(part, 12)
+				-- Moving can yield; recheck the owner and hierarchy before touching the remote.
+				if ownPlot() ~= plot or plot:GetAttribute("OwnerUserId") ~= player.UserId
+					or not toll:IsDescendantOf(plot) or not part:IsDescendantOf(toll)
+					or not upgradeFlags.Tolls or not alive then return end
 				tollAttempts[toll] = os.clock()
 				remote:FireServer(lineIndex)
 				task.wait(3)
