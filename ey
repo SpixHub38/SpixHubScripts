@@ -684,7 +684,7 @@ local function getTollTargets()
 		table.clear(tollTargets)
 		return tollTargets, nil
 	end
-	if plot == lastTollPlot and os.clock() - lastTollScan < 45 then
+	if plot == lastTollPlot and os.clock() - lastTollScan < 20 then
 		return tollTargets, plot
 	end
 	lastTollPlot = plot
@@ -696,50 +696,80 @@ local function getTollTargets()
 			table.insert(tollTargets, object)
 		end
 	end
+	table.sort(tollTargets, function(a, b)
+		return (tonumber(a:GetAttribute("LineIndex")) or math.huge)
+			< (tonumber(b:GetAttribute("LineIndex")) or math.huge)
+	end)
 	return tollTargets, plot
 end
 local tollAttempts = setmetatable({}, {__mode = "k"})
 local function tryTollUpgrade()
 	local remote = endpoint("TollUpgradeEvent", "RemoteEvent")
 	local targets, plot = getTollTargets()
-	if not plot then return end
+	if not plot then
+		setStatus("Waiting for your plot before upgrading tolls.", colors.muted)
+		return
+	end
+	local sent, missingGui, visitedLines, attempted = 0, 0, {}, {}
 	for _, toll in ipairs(targets) do
-		if toll:IsDescendantOf(plot) and plot:GetAttribute("OwnerUserId") == player.UserId then
-			local lineIndex = tonumber(toll:GetAttribute("LineIndex"))
-			local level = tonumber(toll:GetAttribute("TollLevel"))
-			if lineIndex and lineIndex >= 1 and lineIndex % 1 == 0 and level
-				and (not tollAttempts[toll]
-				or os.clock() - tollAttempts[toll] >= 30) then
-				local part = toll.PrimaryPart or toll:FindFirstChildWhichIsA("BasePart", true)
-				if not part then return end
-				moveNear(part, 12)
-				local guiName = string.format("TollUpgradeGUI_Line_%02d", lineIndex)
-				local tollGui = playerGui:WaitForChild(guiName, 3)
-				if not tollGui then
-					setStatus(guiName .. " is not available yet.", colors.muted)
-					return
+		if not upgradeFlags.Tolls or not alive or ownPlot() ~= plot then break end
+		local lineIndex = tonumber(toll:GetAttribute("LineIndex"))
+		if lineIndex and lineIndex >= 1 and lineIndex % 1 == 0
+			and not visitedLines[lineIndex] and toll:IsDescendantOf(plot)
+			and plot:GetAttribute("OwnerUserId") == player.UserId then
+			visitedLines[lineIndex] = true
+			local lastAttempt = tollAttempts[toll]
+			if not lastAttempt or os.clock() - lastAttempt >= 30 then
+				local oldLevel = tonumber(toll:GetAttribute("TollLevel"))
+				local ok, outcome = pcall(function()
+					local guiName = string.format("TollUpgradeGUI_Line_%02d", lineIndex)
+					local tollGui = playerGui:FindFirstChild(guiName)
+					if not tollGui then
+						local part = toll.PrimaryPart or toll:FindFirstChildWhichIsA("BasePart", true)
+						if part then moveNear(part, 12) end
+						tollGui = playerGui:WaitForChild(guiName, 1)
+					end
+					if not tollGui then return "missing" end
+					-- The GUI can appear during movement, so recheck the plot immediately before firing.
+					if ownPlot() ~= plot or plot:GetAttribute("OwnerUserId") ~= player.UserId
+						or not toll:IsDescendantOf(plot) or tollGui.Parent ~= playerGui
+						or tollGui.Name ~= guiName or not upgradeFlags.Tolls or not alive then return end
+					local guiOwner = tollGui:GetAttribute("OwnerUserId")
+					if guiOwner ~= nil and tonumber(guiOwner) ~= player.UserId then return end
+					if (tollGui:IsA("BillboardGui") or tollGui:IsA("SurfaceGui"))
+						and tollGui.Adornee and not tollGui.Adornee:IsDescendantOf(plot) then return end
+					tollAttempts[toll] = os.clock()
+					remote:FireServer(tollGui)
+					return "sent"
+				end)
+				if ok and outcome == "sent" then
+					sent = sent + 1
+					table.insert(attempted, {toll = toll, level = oldLevel})
+					task.wait(0.35)
+				elseif ok and outcome == "missing" then
+					missingGui = missingGui + 1
+				elseif not ok then
+					setStatus("Toll " .. lineIndex .. ": " .. tostring(outcome), colors.red)
 				end
-				-- Moving can yield; recheck the owner and hierarchy before touching the remote.
-				if ownPlot() ~= plot or plot:GetAttribute("OwnerUserId") ~= player.UserId
-					or not toll:IsDescendantOf(plot) or not part:IsDescendantOf(toll)
-					or tollGui.Parent ~= playerGui or tollGui.Name ~= guiName
-					or not upgradeFlags.Tolls or not alive then return end
-				local guiOwner = tollGui:GetAttribute("OwnerUserId")
-				if guiOwner ~= nil and guiOwner ~= player.UserId then return end
-				if (tollGui:IsA("BillboardGui") or tollGui:IsA("SurfaceGui"))
-					and tollGui.Adornee and not tollGui.Adornee:IsDescendantOf(plot) then return end
-				tollAttempts[toll] = os.clock()
-				remote:FireServer(tollGui)
-				task.wait(3)
-				if tonumber(toll:GetAttribute("TollLevel"))
-					and tonumber(toll:GetAttribute("TollLevel")) > level then
-					setStatus("Toll " .. lineIndex .. " upgraded.", colors.green)
-				else
-					setStatus("Toll " .. lineIndex .. " unchanged; the server may require more cash or time.", colors.muted)
-				end
-				return
 			end
 		end
+	end
+	if sent > 0 then
+		task.wait(2)
+		local confirmed = 0
+		for _, entry in ipairs(attempted) do
+			local current = tonumber(entry.toll:GetAttribute("TollLevel"))
+			if current and entry.level and current > entry.level then
+				confirmed = confirmed + 1
+			end
+		end
+		if confirmed > 0 then
+			setStatus("Upgraded " .. confirmed .. " of " .. sent .. " toll line(s) on your plot.", colors.green)
+		else
+			setStatus("Sent " .. sent .. " toll request(s), but no level changed yet. Check cash or game requirements.", colors.muted)
+		end
+	elseif missingGui > 0 then
+		setStatus(missingGui .. " toll GUI(s) unavailable. Visit or open your toll upgrades.", colors.muted)
 	end
 end
 
