@@ -1,0 +1,2295 @@
+-- Spix Hub | Dice & Units | 1.4.8
+-- LocalScript: StarterPlayer > StarterPlayerScripts in the original, running game project.
+-- Built from New Game.rbxlx (PlaceVersion 624). Uses game APIs and owner server extensions.
+-- The uploaded place is a decompiled client snapshot, not a complete runnable server project.
+-- Auto Roll cannot shorten server cooldowns. Rewards still arrive on the server's schedule.
+-- Fusion is random, not a guaranteed tier upgrade. This hub only offers spare matching triples.
+-- Anti AFK attempts VirtualUser input where allowed; a normal LocalScript cannot guarantee
+-- overnight uptime. The game's existing 18-minute AFK rejoin remains available.
+-- Duplicate gear salvage requires Spix_Gear_Salvage_Server.lua in ServerScriptService.
+-- This game has cash upgrades, not skill points. Kaitun manages the real upgrade tree.
+-- Weather-gated rerolls require Spix_Automation_Server.lua.
+-- Smart Auto Sell uses the native SellService and awards the actual game sale proceeds.
+-- Weather rerolls use their matching Trait/Grade weather bonus, not ordinary roll luck.
+
+-- Every script update must add a new entry here, newest first. Keep older entries.
+-- The header uses the newest entry's version so it stays in sync with Changelogs.
+local CHANGELOGS = {
+	{version = "1.4.8", date = "October 3, 2026", notes = {
+		"Retries delayed game data and reconnects missing network events.",
+		"Waits for spin and reroll confirmation before spending again.",
+		"Auto Roll recovers faster when the server is busy.",
+		"Late reroll replies no longer change a new session's budget.",
+		"Dice buying checks your best owned dice and available cash.",
+		"Fixed quest toggle checks and team data with string slot keys.",
+		"Improved narrow-screen feature cards and dragging.",
+		"Removed outdated weather instructions.",
+	}},
+	{version = "1.4.7", date = "October 2, 2026", notes = {
+		"Removed unit and target filters from Trait and Grade rerolls.",
+		"Automatically picks your best income and combat units.",
+		"Aims for the strongest rollable Trait and Grade from the game config.",
+		"Keeps finished units and moves on to the next one.",
+		"Protects the current reroll unit from sales and fusion without locking it.",
+		"Full Kaitun uses the same automatic reroll choices.",
+	}},
+	{version = "1.4.6", date = "October 2, 2026", notes = {
+		"Renamed Full Kaitun to Full Kaitun (Auto Farm).",
+		"Prioritizes best units, storage and the next rebirth.",
+		"Chooses affordable upgrades by gain, cost and payback.",
+		"Equips owned dice before buying stronger dice.",
+		"Uses weather reroll bonuses when available; normal rerolls still work.",
+		"Rechecks spending plans and backs off failed actions.",
+	}},
+	{version = "1.4.5", date = "October 2, 2026", notes = {
+		"Added the Changelogs side tab.",
+		"Shows recent updates, newest first.",
+	}},
+	{version = "1.4.4", date = "October 1, 2026", notes = {
+		"Fixed Trait rerolls using the wrong selected unit.",
+		"Disabled reroll targets no longer block Smart Sell.",
+		"Fixed new-unit checks and large Overflow cleanups.",
+		"Inventory actions wait for delayed sales to finish.",
+		"Fixed native Auto Sell restarting unexpectedly.",
+	}},
+	{version = "1.4.3", date = "October 1, 2026", notes = {
+		"Smart Sell keeps the best actual income and combat stats.",
+		"Rarity, mutation, size and grade no longer exempt weaker units.",
+	}},
+	{version = "1.4.2", date = "October 1, 2026", notes = {
+		"Reworked Smart Sell to sell spare units in batches.",
+		"Clears old locks on units selected for sale.",
+		"Rechecks units before selling after an unlock.",
+	}},
+	{version = "1.4.1", date = "October 1, 2026", notes = {
+		"Removed automatic inventory locking.",
+		"Removed Auto Server Hop for Weather.",
+	}},
+	{version = "1.4.0", date = "October 1, 2026", notes = {
+		"Changed Smart Auto Delete to Smart Auto Sell Unit.",
+		"Smart Sell and Overflow use the game's cash sale system.",
+	}},
+}
+local HUB_VERSION = CHANGELOGS[1].version
+
+local Players = game:GetService("Players")
+local RS = game:GetService("ReplicatedStorage")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local old = playerGui:FindFirstChild("SpixDiceUnitsHub")
+if old then
+	local shutdown = old:FindFirstChild("Shutdown")
+	if shutdown and shutdown:IsA("BindableEvent") then shutdown:Fire() end
+	if old.Parent then old:Destroy() end
+end
+
+local app = {
+	alive = true, modules = {}, moduleErrors = {}, flags = {}, rows = {}, connections = {},
+	requests = {}, retry = {}, failures = {}, ownedLocks = {}, props = {}, activePage = "Main",
+	rollReservations = {}, rollClaims = {}, popupConnections = {},
+	unitWatch = {known = {}, queue = {}, initialized = false}, disposers = {},
+	optionRefresh = {},
+	travel = {pausing = false},
+	kaitun = {saved = nil, saving = false, phase = "Starting"},
+	rollNext = 0, fuseUntil = 0, nativeRoll = nil, nativeTower = nil, nativeSell = nil,
+	tower = {owned = false, nextAt = 0, startAt = 0, floor = 0, stopping = false},
+	rolls = 0, budget = {Traits = 0, Grades = 0}, rerollTargets = {},
+	rerollPending = {}, rerollEpoch = {Traits = 0, Grades = 0}, spinPending = nil,
+	options = {
+		cashReserve = 0, keepCount = 16, maxPayback = 120, fuseMaxIncome = 100,
+		sellMaxIncome = 0, sellRarities = {}, sellSizes = {Normal = true},
+		rerollLimit = 50, tokenReserve = 0, towerId = nil,
+		kaitunSpendPercent = 35, gearFocus = "Auto", gearKeepCopies = 1,
+		weatherMinMultiplier = 2,
+	},
+}
+app.flags.KeepMutations, app.flags.KeepBest, app.flags.SkipAnimation = true, true, true
+app.flags.RareProtection = true
+local colors = {
+	bg = Color3.fromRGB(24, 29, 31), panel = Color3.fromRGB(32, 38, 40),
+	surface = Color3.fromRGB(46, 54, 55), border = Color3.fromRGB(64, 74, 73),
+	text = Color3.fromRGB(220, 227, 220), muted = Color3.fromRGB(163, 176, 167),
+	green = Color3.fromRGB(160, 203, 163), primary = Color3.fromRGB(66, 110, 85),
+	red = Color3.fromRGB(224, 151, 142),
+}
+local function make(kind, props)
+	local item = Instance.new(kind)
+	for key, value in pairs(props) do if key ~= "Parent" then item[key] = value end end
+	item.Parent = props.Parent
+	return item
+end
+local function round(item, radius)
+	make("UICorner", {Parent = item, CornerRadius = UDim.new(0, radius or 10)})
+end
+local function stroke(item)
+	make("UIStroke", {Parent = item, Color = colors.border, Thickness = 1, Transparency = 0.2})
+end
+local function connect(signal, callback)
+	local c = signal:Connect(callback)
+	table.insert(app.connections, c)
+	return c
+end
+local function label(parent, text, size, pos, fontSize, color, bold)
+	return make("TextLabel", {Parent = parent, Text = text, BackgroundTransparency = 1,
+		Size = size, Position = pos, Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+		TextSize = fontSize or 12, TextColor3 = color or colors.text, TextWrapped = true,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center})
+end
+local function button(parent, text, size, pos, color)
+	local b = make("TextButton", {Parent = parent, Text = text, Size = size, Position = pos,
+		BackgroundColor3 = color or colors.surface, BorderSizePixel = 0, AutoButtonColor = true,
+		Font = Enum.Font.GothamSemibold, TextSize = 12, TextColor3 = colors.text, TextWrapped = true})
+	round(b, 8)
+	return b
+end
+local gui = make("ScreenGui", {Parent = playerGui, Name = "SpixDiceUnitsHub", ResetOnSpawn = false,
+	DisplayOrder = 40, ZIndexBehavior = Enum.ZIndexBehavior.Sibling})
+local bounds = make("Frame", {Parent = gui, BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1)})
+local window = make("CanvasGroup", {Parent = bounds, BackgroundColor3 = colors.bg,
+	BorderSizePixel = 0, Size = UDim2.fromOffset(640, 640), ClipsDescendants = true})
+round(window, 12); stroke(window)
+local scale = make("UIScale", {Parent = window, Scale = 1})
+local header = make("Frame", {Parent = window, Size = UDim2.new(1, 0, 0, 70),
+	BackgroundColor3 = colors.panel, BorderSizePixel = 0, Active = true})
+local title = label(header, "Spix Hub | Dice & Units", UDim2.new(1, -168, 0, 28), UDim2.fromOffset(16, 9), 15, colors.text, true)
+local version = label(header, "Version " .. HUB_VERSION, UDim2.new(1, -168, 0, 20), UDim2.fromOffset(16, 38), 11, colors.muted)
+local minimize = button(header, "−", UDim2.fromOffset(40, 42), UDim2.new(1, -140, 0, 14))
+local maximize = button(header, "□", UDim2.fromOffset(40, 42), UDim2.new(1, -94, 0, 14))
+local close = button(header, "×", UDim2.fromOffset(40, 42), UDim2.new(1, -48, 0, 14))
+local reopen = button(bounds, "Open Spix Hub", UDim2.fromOffset(150, 44), UDim2.new(0, 12, 1, -12), colors.primary)
+reopen.AnchorPoint, reopen.Visible = Vector2.new(0, 1), false
+local nav = make("ScrollingFrame", {Parent = window, Position = UDim2.fromOffset(12, 82),
+	Size = UDim2.new(0, 136, 1, -135), BackgroundColor3 = colors.panel, BorderSizePixel = 0,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollBarThickness = 2})
+round(nav); stroke(nav)
+make("UIListLayout", {Parent = nav, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder})
+make("UIPadding", {Parent = nav, PaddingLeft = UDim.new(0, 7), PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8)})
+local footer = label(window, "Loading game data...", UDim2.new(1, -28, 0, 35), UDim2.new(0, 14, 1, -42), 11, colors.muted)
+local pageNames = {"Main", "Dice & Spins", "Units", "Inventory", "Traits & Grades", "Weather", "Combat & Quests", "Settings", "Changelogs"}
+local pages, tabs = {}, {}
+local mode, restoreMode, normalPos, miniPos, openSerial = "normal", "normal", nil, nil, 0
+local popup = make("Frame", {Parent = window, Visible = false, ZIndex = 30,
+	Size = UDim2.new(1, -24, 1, -95), Position = UDim2.fromOffset(12, 77), BackgroundColor3 = colors.panel, BorderSizePixel = 0})
+round(popup); stroke(popup)
+local popupTitle = label(popup, "Choose", UDim2.new(1, -72, 0, 44), UDim2.fromOffset(14, 0), 13, colors.text, true)
+popupTitle.ZIndex = 31
+local popupClose = button(popup, "×", UDim2.fromOffset(42, 38), UDim2.new(1, -51, 0, 5)); popupClose.ZIndex = 31
+local popupList = make("ScrollingFrame", {Parent = popup, ZIndex = 31, BackgroundTransparency = 1,
+	Position = UDim2.fromOffset(12, 51), Size = UDim2.new(1, -24, 1, -62), BorderSizePixel = 0,
+	AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(), ScrollBarThickness = 3})
+make("UIListLayout", {Parent = popupList, Padding = UDim.new(0, 6)})
+connect(popupClose.Activated, function() popup.Visible = false end)
+
+local function layout()
+	local view = bounds.AbsoluteSize
+	if view.X < 2 or view.Y < 2 then return end
+	local aw, ah = math.max(1, view.X - 20), math.max(1, view.Y - 20)
+	local width = mode == "minimized" and math.min(280, aw) or mode == "maximized" and math.min(960, aw) or math.min(680, aw)
+	local height = mode == "minimized" and math.min(70, ah) or mode == "maximized" and math.min(850, ah) or math.min(670, ah)
+	local narrow = width < 430 and mode ~= "minimized"
+	local hh = narrow and 105 or 70
+	window.Size = UDim2.fromOffset(width, height)
+	title.Text = mode == "minimized" and "Spix Hub" or "Spix Hub | Dice & Units"
+	normalPos = normalPos or Vector2.new((view.X - width) / 2, (view.Y - height) / 2)
+	local pos = mode == "maximized" and Vector2.new((view.X - width) / 2, (view.Y - height) / 2)
+		or mode == "minimized" and (miniPos or normalPos) or normalPos
+	pos = Vector2.new(math.clamp(pos.X, 0, math.max(0, view.X - width)), math.clamp(pos.Y, 0, math.max(0, view.Y - height)))
+	window.Position = UDim2.fromOffset(pos.X, pos.Y)
+	header.Size = UDim2.new(1, 0, 0, hh)
+	title.Size = UDim2.new(1, narrow and -32 or -168, 0, 28)
+	version.Size = UDim2.new(1, narrow and -32 or -168, 0, 20)
+	minimize.Position = UDim2.new(1, -140, 0, narrow and 60 or 14)
+	maximize.Position = UDim2.new(1, -94, 0, narrow and 60 or 14)
+	close.Position = UDim2.new(1, -48, 0, narrow and 60 or 14)
+	maximize.Text = mode == "maximized" and "▣" or "□"
+	minimize.Text = mode == "minimized" and "+" or "−"
+	local nw = width < 500 and 102 or 136
+	nav.Position, nav.Size = UDim2.fromOffset(12, hh + 12), UDim2.new(0, nw, 1, -(hh + 65))
+	nav.Visible, footer.Visible = mode ~= "minimized", mode ~= "minimized"
+	popup.Position, popup.Size = UDim2.fromOffset(12, hh + 7), UDim2.new(1, -24, 1, -(hh + 25))
+	for name, page in pairs(pages) do
+		page.Position, page.Size = UDim2.fromOffset(nw + 24, hh + 12), UDim2.new(1, -(nw + 36), 1, -(hh + 65))
+		page.Visible = mode ~= "minimized" and name == app.activePage
+		tabs[name].BackgroundColor3 = name == app.activePage and colors.primary or colors.panel
+	end
+end
+for index, name in ipairs(pageNames) do
+	pages[name] = make("ScrollingFrame", {Parent = window, BackgroundTransparency = 1, BorderSizePixel = 0,
+		CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollBarThickness = 3,
+		ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarImageColor3 = colors.muted})
+	make("UIListLayout", {Parent = pages[name], Padding = UDim.new(0, 10), SortOrder = Enum.SortOrder.LayoutOrder})
+	make("UIPadding", {Parent = pages[name], PaddingBottom = UDim.new(0, 12)})
+	tabs[name] = button(nav, name, UDim2.new(1, -14, 0, 46), UDim2.new())
+	tabs[name].LayoutOrder = index
+	connect(tabs[name].Activated, function() app.activePage = name; popup.Visible = false; layout() end)
+end
+connect(bounds:GetPropertyChangedSignal("AbsoluteSize"), layout)
+local function animate(open)
+	openSerial = openSerial + 1
+	local serial = openSerial
+	if open then window.Visible = true; reopen.Visible = false; layout() else popup.Visible = false end
+	TweenService:Create(window, TweenInfo.new(0.23, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {GroupTransparency = open and 0 or 1}):Play()
+	TweenService:Create(scale, TweenInfo.new(0.23, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {Scale = open and 1 or 0.96}):Play()
+	if not open then task.delay(0.24, function()
+		if app.alive and serial == openSerial then window.Visible = false; reopen.Visible = true end
+	end) end
+end
+connect(close.Activated, function() animate(false) end)
+connect(reopen.Activated, function() animate(true) end)
+connect(minimize.Activated, function()
+	popup.Visible = false
+	if mode == "minimized" then mode = restoreMode else restoreMode, mode = mode, "minimized" end
+	layout()
+end)
+connect(maximize.Activated, function()
+	popup.Visible = false
+	mode = mode == "maximized" and "normal" or "maximized"
+	restoreMode = mode; layout()
+end)
+do
+	local dragging, input, start, origin, press
+	connect(header.InputBegan, function(i)
+		if not dragging and (i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch) then
+			dragging, start, origin = true, i.Position, window.AbsolutePosition - bounds.AbsolutePosition
+			press = i
+			if i.UserInputType == Enum.UserInputType.Touch then input = i end
+		end
+	end)
+	connect(header.InputChanged, function(i)
+		if dragging and press and (i == press or press.UserInputType == Enum.UserInputType.MouseButton1
+			and i.UserInputType == Enum.UserInputType.MouseMovement) then input = i end
+	end)
+	connect(UIS.InputChanged, function(i)
+		if dragging and i == input and mode ~= "maximized" then
+			local delta = i.Position - start
+			local p = origin + Vector2.new(delta.X, delta.Y)
+			if mode == "minimized" then miniPos = p else normalPos = p end
+			layout()
+		end
+	end)
+	connect(UIS.InputEnded, function(i)
+		if i == press or press and press.UserInputType == Enum.UserInputType.MouseButton1 and i.UserInputType == Enum.UserInputType.MouseButton1 then
+			dragging, press, input = false, nil, nil
+		end
+	end)
+end
+
+local function report(key, message, errorState)
+	if not app.alive then return end
+	local row = app.rows[key]
+	if row then row.status.Text, row.status.TextColor3 = message, errorState and colors.red or colors.muted end
+end
+local function toggle(key, enabled, managed)
+	if not managed and app.flags.Kaitun and app.kaitun.saved and app.kaitun.saved[key] ~= nil then
+		-- A manual control takes over cleanly; restore the other controls first.
+		toggle("Kaitun", false, true)
+	end
+	app.flags[key] = enabled
+	local row = app.rows[key]
+	if row then
+		row.button.Text = enabled and "ON" or "OFF"
+		row.button.BackgroundColor3 = enabled and colors.primary or colors.surface
+		row.status.Text = enabled and "Starting..." or "Paused"
+	end
+	app.retry[key] = 0
+	if app.failures then app.failures[key] = 0 end
+	if key == "Traits" or key == "Grades" then
+		app.budget[key] = 0
+		app.rerollEpoch = app.rerollEpoch or {}
+		app.rerollEpoch[key] = (app.rerollEpoch[key] or 0) + 1
+	end
+	if app.onToggle then app.onToggle(key, enabled) end
+end
+local function panel(page, height)
+	local f = make("Frame", {Parent = pages[page], BackgroundColor3 = colors.panel,
+		BorderSizePixel = 0, Size = UDim2.new(1, -5, 0, height)})
+	round(f); stroke(f)
+	return f
+end
+local function feature(page, key, name, description)
+	local f = panel(page, 0); f.AutomaticSize = Enum.AutomaticSize.Y
+	make("UIPadding", {Parent = f, PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
+		PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 10)})
+	make("UIListLayout", {Parent = f, Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder})
+	local row = make("Frame", {Parent = f, BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0),
+		AutomaticSize = Enum.AutomaticSize.Y, LayoutOrder = 1})
+	local rowLayout = make("UIListLayout", {Parent = row, FillDirection = Enum.FillDirection.Horizontal,
+		Padding = UDim.new(0, 12), SortOrder = Enum.SortOrder.LayoutOrder})
+	local heading = label(row, name, UDim2.new(1, -78, 0, 36), UDim2.new(), 13, colors.text, true)
+	heading.AutomaticSize, heading.LayoutOrder = Enum.AutomaticSize.Y, 1
+	local b = button(row, "OFF", UDim2.fromOffset(66, 34), UDim2.new()); b.LayoutOrder = 2
+	local d = label(f, description, UDim2.new(1, 0, 0, 0), UDim2.new(), 11, colors.muted)
+	d.AutomaticSize, d.LayoutOrder = Enum.AutomaticSize.Y, 2
+	local s = label(f, "Paused", UDim2.new(1, 0, 0, 0), UDim2.new(), 10, colors.muted)
+	s.AutomaticSize, s.LayoutOrder = Enum.AutomaticSize.Y, 3
+	local wasNarrow
+	local function fit()
+		local narrow = row.AbsoluteSize.X < 220
+		if narrow == wasNarrow then return end
+		wasNarrow = narrow
+		rowLayout.FillDirection = narrow and Enum.FillDirection.Vertical or Enum.FillDirection.Horizontal
+		rowLayout.Padding = UDim.new(0, narrow and 6 or 12)
+		heading.Size = UDim2.new(1, narrow and 0 or -78, 0, 36)
+	end
+	connect(row:GetPropertyChangedSignal("AbsoluteSize"), fit); fit()
+	app.rows[key] = {button = b, status = s}
+	b.Text, b.BackgroundColor3 = app.flags[key] and "ON" or "OFF", app.flags[key] and colors.primary or colors.surface
+	connect(b.Activated, function() toggle(key, not app.flags[key]) end)
+	return f
+end
+local function numberInput(page, name, option, min, max)
+	local f = panel(page, 80)
+	label(f, name, UDim2.new(1, -24, 0, 26), UDim2.fromOffset(12, 3), 12)
+	local box = make("TextBox", {Parent = f, BackgroundColor3 = colors.surface, BorderSizePixel = 0,
+		Text = tostring(app.options[option]), Size = UDim2.new(1, -24, 0, 34), Position = UDim2.fromOffset(12, 34),
+		ClearTextOnFocus = false, Font = Enum.Font.Gotham, TextSize = 12, TextColor3 = colors.text})
+	round(box, 7)
+	app.optionRefresh[option] = function() box.Text = tostring(app.options[option]) end
+	connect(box.FocusLost, function()
+		local value = tonumber(box.Text)
+		if value and value == value and value >= min and value <= max then app.options[option] = value end
+		box.Text = tostring(app.options[option])
+	end)
+end
+local function dropdown(page, name, provider, selection, multi)
+	local f = panel(page, 78)
+	label(f, name, UDim2.new(1, -24, 0, 26), UDim2.fromOffset(12, 3), 12)
+	local b = button(f, "Choose  ▾", UDim2.new(1, -24, 0, 33), UDim2.fromOffset(12, 34))
+	local function refreshCaption()
+		if multi then
+			local count = 0
+			for _, yes in pairs(app.options[selection]) do if yes then count = count + 1 end end
+			b.Text = count .. " selected  ▾"
+		else
+			local caption = tostring(app.options[selection] or "Choose")
+			local ok, choices = pcall(provider)
+			if ok and type(choices) == "table" then
+				for _, choice in ipairs(choices) do if choice.id == app.options[selection] then caption = choice.text; break end end
+			end
+			b.Text = caption .. "  ▾"
+		end
+	end
+	refreshCaption()
+	app.optionRefresh[selection] = refreshCaption
+	connect(b.Activated, function()
+		for _, connection in ipairs(app.popupConnections) do connection:Disconnect() end
+		app.popupConnections = {}
+		for _, child in ipairs(popupList:GetChildren()) do if child:IsA("GuiButton") or child:IsA("TextLabel") then child:Destroy() end end
+		popupTitle.Text, popup.Visible = name, true
+		popupList.CanvasPosition = Vector2.new()
+		local ok, choices = pcall(provider)
+		if not ok or not choices or #choices == 0 then
+			local l = label(popupList, "Waiting for game data...", UDim2.new(1, -5, 0, 40), UDim2.new(), 12, colors.muted); l.ZIndex = 32
+			return
+		end
+		for i, choice in ipairs(choices) do
+			if i > 250 then break end
+			local selected = multi and app.options[selection][choice.id] or not multi and app.options[selection] == choice.id
+			local item = button(popupList, (selected and "✓  " or "") .. choice.text,
+				UDim2.new(1, -5, 0, 44), UDim2.new(), selected and colors.primary or colors.surface)
+			item.ZIndex = 32
+			table.insert(app.popupConnections, item.Activated:Connect(function()
+				if multi then
+					app.options[selection][choice.id] = not app.options[selection][choice.id]
+					local yes = app.options[selection][choice.id]
+					item.Text = (yes and "✓  " or "") .. choice.text
+					item.BackgroundColor3 = yes and colors.primary or colors.surface
+				else app.options[selection] = choice.id; popup.Visible = false end
+				refreshCaption()
+			end))
+		end
+	end)
+end
+local function compact(n)
+	if type(n) ~= "number" then return "--" end
+	local suffix = {"", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No"}
+	local i = 1
+	while math.abs(n) >= 1000 and i < #suffix do n, i = n / 1000, i + 1 end
+	if math.abs(n) >= 1000 then return string.format("%.2e", n * 1000 ^ (i - 1)) end
+	return string.format("%.2f%s", n, suffix[i])
+end
+local function need(name)
+	return assert(app.modules[name], "Waiting for " .. name .. (app.moduleErrors[name] and ": " .. app.moduleErrors[name] or " to load."))
+end
+local function read(field)
+	local data = app.modules.Data
+	if not data then return nil end
+	local ok, value = pcall(function() return data[field]() end)
+	if ok then return value end
+end
+local function inventory()
+	local inv = read("Inventory")
+	return type(inv) == "table" and inv or nil
+end
+local function cash()
+	local value = read("Money")
+	if type(value) == "number" and value >= 0 and value < math.huge and value == value then return value end
+end
+local function config(entry)
+	return entry and app.modules.Units and app.modules.Units.entries[entry.name]
+end
+local function score(cfg, stat, attributes)
+	if not cfg or type(cfg[stat]) ~= "function" then return nil end
+	local ok, value = pcall(cfg[stat], attributes or {})
+	if ok and type(value) == "number" and value >= 0 and value < math.huge and value == value then return value end
+end
+local function ranked(inv, stat)
+	local result = {}
+	for id, entry in pairs(inv or {}) do
+		local cfg = config(entry)
+		local value = score(cfg, stat, entry.attributes)
+		if value then table.insert(result, {id = id, entry = entry, cfg = cfg, value = value}) end
+	end
+	table.sort(result, function(a, b) return a.value > b.value or a.value == b.value and a.id < b.id end)
+	return result
+end
+local function unitCount(inv)
+	local count = 0
+	for _, entry in pairs(inv or {}) do if config(entry) then count = count + 1 end end
+	return count
+end
+local function unitMetadata(id, entry)
+	local cfg = config(entry)
+	if not cfg or type(entry.attributes) ~= "table" or entry.amount ~= 1 then return nil end
+	local a = entry.attributes
+	local baseIncome, income = score(cfg, "income", {}), score(cfg, "income", a)
+	local ok, rarity = pcall(function() return cfg.getRarity and cfg.getRarity(a) or cfg.rarity end)
+	if not baseIncome or not income or not ok or type(rarity) ~= "string" then return nil end
+	return {id = id, cfg = cfg, entry = entry, rarity = rarity, mutation = a.mutation,
+		size = cfg.variant or "Normal", grade = a.grade or "None", baseIncome = baseIncome, income = income}
+end
+local function rollKey(name, mutation)
+	return tostring(name) .. "\0" .. tostring(mutation or "")
+end
+local function pendingRollUnits(inv)
+	-- Match replicated GUIDs to accepted rewards, rather than guessing network delay.
+	for id in pairs(app.rollClaims) do if not inv[id] then app.rollClaims[id] = nil end end
+	local total = 0
+	for index = #app.rollReservations, 1, -1 do
+		local reservation = app.rollReservations[index]
+		if reservation.expected then
+			for id, entry in pairs(inv) do
+				local key = rollKey(entry.name, (entry.attributes or {}).mutation)
+				if not reservation.baseline[id] and not app.rollClaims[id] and (reservation.expected[key] or 0) > 0 then
+					reservation.expected[key] = reservation.expected[key] - 1
+					reservation.remaining = reservation.remaining - 1
+					app.rollClaims[id] = true
+				end
+			end
+		end
+		if reservation.remaining <= 0 then table.remove(app.rollReservations, index)
+		else total = total + reservation.remaining end
+	end
+	return total
+end
+local function unitChoices()
+	local choices = {}
+	for _, unit in ipairs(ranked(inventory(), "income")) do
+		table.insert(choices, {id = unit.id, text = unit.entry.name .. " · " .. compact(unit.value) .. "/s · " .. unit.id:sub(1, 6)})
+	end
+	return choices
+end
+local function mapChoices(name, orderField)
+	local result = {}
+	for id, value in pairs(need(name)) do
+		if type(value) == "table" then table.insert(result, {id = id, text = id, order = value[orderField] or 0}) end
+	end
+	table.sort(result, function(a, b) return a.order < b.order or a.order == b.order and a.id < b.id end)
+	return result
+end
+
+feature("Main", "Kaitun", "Full Kaitun (Auto Farm)", "Plans upgrades, rebirths and storage around your best units.")
+numberInput("Main", "Kaitun cash per purchase (%)", "kaitunSpendPercent", 1, 100)
+feature("Main", "AutoRoll", "Auto Roll", "Rolls repeatedly. Waits for the server cooldown.")
+feature("Main", "FastRoll", "Fast Roll", "Uses the current minimum roll interval.")
+feature("Main", "Collect", "Auto Collect Cash", "Collects earned balances from your plot slots.")
+feature("Main", "Rebirth", "Auto Rebirth", "Rebirths as soon as you have enough cash.")
+feature("Main", "AntiAFK", "Anti AFK", "Attempts idle input where the client allows it.")
+feature("Dice & Spins", "SkipAnimation", "Skip Animation", "Hides the hub's roll animation and native roll panel.")
+feature("Dice & Spins", "BuyDice", "Auto Buy Dice", "Buys the next affordable dice with better luck.")
+feature("Dice & Spins", "EquipDice", "Auto Equip Best Dice", "Equips your owned dice with the highest luck.")
+feature("Dice & Spins", "Lucky", "Auto Lucky Spin", "Uses owned Lucky Spins on your next rolls.")
+feature("Dice & Spins", "Jackpot", "Auto Jackpot Spin", "Uses owned Jackpot Spins on your next rolls.")
+local rollDisplay = panel("Dice & Spins", 82)
+local rollResult = label(rollDisplay, "Last roll: --", UDim2.new(1, -24, 1, -12), UDim2.fromOffset(12, 6), 12, colors.green)
+feature("Units", "Place", "Auto Place Best Units", "Places your highest income units on your plot.")
+feature("Units", "Level", "Smart Level Up", "Upgrades placed units with a short payback time.")
+numberInput("Units", "Maximum payback (seconds)", "maxPayback", 1, 86400)
+feature("Units", "Fuse", "Auto Fuse", "Fuses spare matching units. The result is random.")
+numberInput("Units", "Maximum input income for fusion", "fuseMaxIncome", 0, 1e30)
+feature("Units", "Team", "Auto Equip Best Team", "Equips the strongest damage team for towers.")
+feature("Units", "Gear", "Auto Equip & Salvage Gear", "Equips strong gear. Scraps inferior duplicates; keeps one.")
+dropdown("Units", "Gear focus", function()
+	return {{id = "Auto", text = "Auto"}, {id = "Money", text = "Money"}, {id = "Luck", text = "Luck"},
+		{id = "Combat", text = "Combat"}, {id = "Balanced", text = "Balanced"}}
+end, "gearFocus", false)
+numberInput("Units", "Copies of each gear to keep", "gearKeepCopies", 1, 100)
+feature("Inventory", "Sell", "Conditional Auto Sell", "Sells selected rarities or low income units.")
+dropdown("Inventory", "Sell rarities", function()
+	local seen, result = {}, {}
+	for _, cfg in pairs(need("Units").entries) do
+		local rarity = cfg.rarity
+		if rarity and not seen[rarity] then seen[rarity] = true; table.insert(result, {id = rarity, text = rarity}) end
+	end
+	table.sort(result, function(a, b) return a.id < b.id end)
+	return result
+end, "sellRarities", true)
+dropdown("Inventory", "Sell sizes", function() return {{id = "Normal", text = "Normal"}, {id = "Huge", text = "Huge"}, {id = "Titanic", text = "Titanic"}} end, "sellSizes", true)
+numberInput("Inventory", "Sell below income (0 disables)", "sellMaxIncome", 0, 1e30)
+feature("Inventory", "KeepMutations", "Keep Mutations", "For filtered sales and fusion. Smart Sell ranks by stats.")
+feature("Inventory", "KeepBest", "Keep Best Units", "Keeps your strongest units out of cleanup and fusion.")
+numberInput("Inventory", "Best income units to keep", "keepCount", 1, 1000)
+feature("Inventory", "SmartSell", "Smart Auto Sell Unit", "Keeps your best income and combat units. Sells weaker units of any rarity.")
+local unlockSparePanel = panel("Inventory", 122)
+local unlockSpareButton = button(unlockSparePanel, "Unlock low-income spares", UDim2.new(1, -24, 0, 36), UDim2.fromOffset(12, 10))
+label(unlockSparePanel, "Clears weaker units’ locks, including manual locks. Keeps your best units.",
+	UDim2.new(1, -24, 0, 32), UDim2.fromOffset(12, 49), 11, colors.muted)
+local unlockSpareStatus = label(unlockSparePanel, "Use this to clear old locks that block cleanup.",
+	UDim2.new(1, -24, 0, 29), UDim2.fromOffset(12, 85), 11, colors.muted)
+connect(unlockSpareButton.Activated, function()
+	app.unlockSpareRequested, app.unlockSpareTotal, app.unlockSpareAttempts = true, 0, 0
+	unlockSpareStatus.Text = "Queued. Waiting for current inventory actions."
+end)
+feature("Inventory", "RareProtection", "Protect Rare Units", "For filtered sales and fusion. Smart Sell ranks by stats.")
+feature("Inventory", "Overflow", "Inventory Overflow Auto Sell", "At 95% storage, sells low-income spares to free space.")
+feature("Traits & Grades", "Traits", "Auto Reroll Traits", "Picks your best units and rolls for their strongest trait.")
+feature("Traits & Grades", "Grades", "Auto Reroll Grades", "Picks your best units and rolls for the highest grade.")
+numberInput("Traits & Grades", "Maximum rerolls per start", "rerollLimit", 1, 10000)
+numberInput("Traits & Grades", "Tokens to leave unspent", "tokenReserve", 0, 1e20)
+feature("Weather", "WeatherReroll", "Auto Reroll on Weather Multiplier", "Runs enabled Trait/Grade rerolls during matching weather.")
+numberInput("Weather", "Minimum weather multiplier", "weatherMinMultiplier", 1.01, 100)
+local weatherDisplay = panel("Weather", 96)
+local weatherLabel = label(weatherDisplay, "Weather: loading...", UDim2.new(1, -24, 1, -12), UDim2.fromOffset(12, 6), 12, colors.green)
+dropdown("Combat & Quests", "Tower", function()
+	local result = {}
+	for id, cfg in pairs(need("Towers").GetAll()) do table.insert(result, {id = id, text = id .. " · " .. tostring(cfg.name or ""), order = cfg.order or 0}) end
+	table.sort(result, function(a, b) return a.order < b.order or a.order == b.order and a.id < b.id end)
+	return result
+end, "towerId", false)
+feature("Combat & Quests", "Tower", "Auto Tower Farm", "Runs the selected tower with your best damage team.")
+feature("Combat & Quests", "Quests", "Auto Claim Quests", "Claims completed quests and ready daily rewards.")
+feature("Combat & Quests", "Upgrades", "Auto Buy Upgrades", "Buys affordable upgrades in the upgrade tree.")
+numberInput("Settings", "Cash to leave unspent", "cashReserve", 0, 1e30)
+local unload = button(panel("Settings", 62), "Unload Hub", UDim2.new(1, -24, 0, 38), UDim2.fromOffset(12, 12))
+for index, entry in ipairs(CHANGELOGS) do
+	local card = panel("Changelogs", 0)
+	card.AutomaticSize, card.LayoutOrder = Enum.AutomaticSize.Y, index
+	make("UIPadding", {Parent = card, PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 12),
+		PaddingTop = UDim.new(0, 12), PaddingBottom = UDim.new(0, 12)})
+	make("UIListLayout", {Parent = card, Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder})
+	local heading = label(card, "v" .. entry.version .. (index == 1 and " · Latest" or ""),
+		UDim2.new(1, 0, 0, 0), UDim2.new(), 13, index == 1 and colors.green or colors.text, true)
+	heading.AutomaticSize, heading.LayoutOrder = Enum.AutomaticSize.Y, 1
+	local date = label(card, entry.date, UDim2.new(1, 0, 0, 0), UDim2.new(), 10, colors.muted)
+	date.AutomaticSize, date.LayoutOrder = Enum.AutomaticSize.Y, 2
+	local notes = label(card, "• " .. table.concat(entry.notes, "\n• "),
+		UDim2.new(1, 0, 0, 0), UDim2.new(), 12, colors.text)
+	notes.AutomaticSize, notes.LayoutOrder = Enum.AutomaticSize.Y, 3
+	notes.TextYAlignment = Enum.TextYAlignment.Top
+end
+layout()
+
+local function remote(namespace, kind, name)
+	local network = RS:FindFirstChild("Network")
+	local folder = network and (namespace == "" and network or network:FindFirstChild(namespace))
+	local group = folder and folder:FindFirstChild(kind)
+	local object = group and group:FindFirstChild(name)
+	assert(object and object:IsA(kind == "RF" and "RemoteFunction" or "RemoteEvent"),
+		"Missing " .. namespace .. "/" .. name .. " in this game version.")
+	return object
+end
+local function fire(namespace, name, ...)
+	remote(namespace, "RE", name):FireServer(...)
+end
+local function invoke(namespace, name, ...)
+	local key = namespace .. "/" .. name
+	assert(not app.requests[key], "A " .. name .. " request is still pending.")
+	local args, request = table.pack(...), {done = false}
+	local budgetEpoch = app.rerollEpoch and app.rerollEpoch[args[1]] or 0
+	local object = remote(namespace, "RF", name)
+	local reservation
+	if namespace == "RollService" and name == "RollDice" then
+		local baseline = {}
+		for id in pairs(inventory() or {}) do baseline[id] = true end
+		local controller = app.modules.Buffs
+		local ok, amount = pcall(function() return controller.GetBuff("Rolls") end)
+		local count = ok and type(amount) == "number" and amount == amount and amount > 0 and amount < math.huge and math.floor(amount) or 1
+		reservation = {baseline = baseline, remaining = count}
+		table.insert(app.rollReservations, reservation)
+	end
+	app.requests[key] = request
+	task.spawn(function()
+		request.result = table.pack(pcall(object.InvokeServer, object, table.unpack(args, 1, args.n)))
+		if reservation then
+			local results = request.result[1] and request.result[2]
+			reservation.expected, reservation.remaining = {}, 0
+			if type(results) == "table" then
+				for _, result in ipairs(results) do
+					if type(result) == "table" and app.modules.Units and app.modules.Units.entries[result.result] then
+						local rewardKey = rollKey(result.result, result.mutation)
+						reservation.expected[rewardKey] = (reservation.expected[rewardKey] or 0) + 1
+						reservation.remaining = reservation.remaining + 1
+					end
+				end
+			end
+		end
+		-- Keep ownership correct even if a tower response arrives after our timeout.
+		if namespace == "Towers" and request.result[1] then
+			if name == "PlayTower" and request.result[2] == true then
+				app.tower.owned, app.tower.id = true, args[1]
+				if not app.flags.Tower then app.tower.stopping = true end
+			elseif name == "CompleteTowerFloor" and type(request.result[2]) == "table" then
+				if app.sequenceDuration then
+					local ok, seconds = pcall(app.sequenceDuration, request.result[2])
+					if ok and type(seconds) == "number" and seconds >= 0 and seconds < math.huge then app.tower.nextAt = os.clock() + seconds + 0.1 end
+				end
+				for _, action in ipairs(request.result[2]) do
+					if type(action) == "table" and action.action == "ended" then app.tower.owned, app.tower.stopping = false, false end
+				end
+			end
+		end
+		if namespace == "SpixAutomation" and name == "WeatherReroll" and request.result[1]
+			and type(request.result[2]) == "table" and request.result[2].spent == true and app.budget[args[1]]
+			and (app.rerollEpoch and app.rerollEpoch[args[1]] or 0) == budgetEpoch then
+			app.budget[args[1]] = app.budget[args[1]] + 1
+		end
+		request.done = true
+		if app.requests[key] == request then app.requests[key] = nil end
+		if not app.alive and namespace == "Towers" and app.cleanupTower then app.cleanupTower() end
+	end)
+	local deadline = os.clock() + 8
+	while not request.done and app.alive and os.clock() < deadline do task.wait(0.05) end
+	assert(request.done, name .. " is waiting for the server; no duplicate request sent.")
+	assert(request.result[1], tostring(request.result[2]))
+	return table.unpack(request.result, 2, request.result.n)
+end
+local function waitForChange(predicate, seconds)
+	local deadline = os.clock() + seconds
+	repeat
+		if predicate() then return true end
+		if not app.alive then return false end
+		task.wait(0.07)
+	until os.clock() >= deadline
+	return predicate()
+end
+local function optionalAutomation(name)
+	local network = RS:FindFirstChild("Network")
+	local folder = network and network:FindFirstChild("SpixAutomation")
+	local rf = folder and folder:FindFirstChild("RF")
+	local object = rf and rf:FindFirstChild(name)
+	return object and object:IsA("RemoteFunction") and object or nil
+end
+local function readyToSpend(price, action)
+	if type(price) ~= "number" or price < 0 or price >= math.huge or price ~= price then return false end
+	local balance = cash()
+	if app.flags.Rebirth and app.modules.Rebirths and type(read("Rebirth")) == "number" then
+		local nextRebirth = app.modules.Rebirths.GetNext(read("Rebirth"))
+		if balance and nextRebirth and balance >= nextRebirth.cost then return false end
+	end
+	if not balance or balance < price + app.options.cashReserve then return false end
+	if app.flags.Kaitun then
+		if app.kaitun.saving or app.kaitun.ready == false then return false end
+		if action and app.kaitun.cashAction ~= action then return false end
+		return price <= (balance - app.options.cashReserve) * app.options.kaitunSpendPercent / 100
+	end
+	return true
+end
+local function buff(name, default)
+	local controller = app.modules.Buffs
+	local ok, value = pcall(function() return controller.GetBuff(name) end)
+	return ok and type(value) == "number" and value > 0 and value < math.huge and value or default
+end
+local function currentWeather()
+	local active, cfg = app.props.ActiveWeather, app.modules.WeatherConfig
+	if not app.props.ActiveWeatherReady or not cfg or type(active) ~= "table" or type(active.name) ~= "string"
+		or type(active.startedAt) ~= "number" or type(active.duration) ~= "number" then return nil end
+	local remaining = active.startedAt + active.duration - workspace:GetServerTimeNow()
+	if remaining <= 0 or remaining ~= remaining or remaining >= math.huge then return nil end
+	local ok, weather = pcall(cfg.Get, active.name)
+	if not ok or type(weather) ~= "table" then return nil end
+	return {name = active.name, remaining = remaining, buffs = weather.buffs or {}}
+end
+local function weatherMultiplier(stat)
+	local weather = currentWeather()
+	local value = weather and weather.buffs[stat]
+	if not value or type(value.amount) ~= "number" or value.amount ~= value.amount or value.amount >= math.huge then return 1 end
+	if value.bucket == "multiplier" then return math.max(0, value.amount)
+	elseif value.bucket == "percentage" or value.bucket == "base" then return math.max(0, 1 + value.amount) end
+	return 1
+end
+local function weatherAllows(key)
+	if not app.flags.WeatherReroll then return true end
+	local stat = key == "Traits" and "Trait Luck" or "Grade Luck"
+	return weatherMultiplier(stat) >= app.options.weatherMinMultiplier and (currentWeather() or {remaining = 0}).remaining > 1
+end
+local function gearDominates(stronger, weaker)
+	if stronger.slot ~= weaker.slot then return false end
+	local stats, better = {}, false
+	for stat in pairs(stronger.buffs or {}) do stats[stat] = true end
+	for stat in pairs(weaker.buffs or {}) do stats[stat] = true end
+	for stat in pairs(stats) do
+		local a, b = (stronger.buffs or {})[stat], (weaker.buffs or {})[stat]
+		if a and b and a.bucket ~= b.bucket then return false end
+		local bucket = a and a.bucket or b.bucket
+		if bucket ~= "multiplier" and bucket ~= "percentage" and bucket ~= "base" then return false end
+		local neutral = bucket == "multiplier" and 1 or 0
+		local av, bv = a and a.amount or neutral, b and b.amount or neutral
+		if type(av) ~= "number" or type(bv) ~= "number" or av ~= av or bv ~= bv
+			or av >= math.huge or bv >= math.huge or av < bv then return false end
+		if av > bv then better = true end
+	end
+	return better
+end
+local function gearWeights()
+	local focus = app.options.gearFocus
+	if app.flags.Kaitun then focus = app.kaitun.saving and "Money" or "Balanced" end
+	if focus == "Auto" then
+		focus = app.flags.Kaitun and (app.kaitun.saving and "Money" or "Balanced") or "Balanced"
+	end
+	local weights = {Luck = 1, ["Money Multiplier"] = 1, ["Damage Multiplier"] = 1,
+		["Health Multiplier"] = 1, ["Trait Luck"] = 0.25, ["Grade Luck"] = 0.25, Walkspeed = 0.1}
+	if focus == "Money" then weights["Money Multiplier"] = 8
+	elseif focus == "Luck" then weights.Luck = 8
+	elseif focus == "Combat" then weights["Damage Multiplier"], weights["Health Multiplier"] = 8, 4 end
+	return weights
+end
+local function gearSetScore(selection, entries, weights)
+	local buckets = {}
+	for _, name in pairs(selection) do
+		local cfg = name and entries[name]
+		for stat, value in pairs(cfg and cfg.buffs or {}) do
+			local amount = value.amount
+			if type(amount) == "number" and amount == amount and amount < math.huge then
+				local item = buckets[stat] or {base = 0, percent = 1, multiplier = 1}
+				if value.bucket == "base" then item.base = item.base + amount
+				elseif value.bucket == "percentage" then item.percent = item.percent + amount
+				elseif value.bucket == "multiplier" then item.multiplier = item.multiplier * amount end
+				buckets[stat] = item
+			end
+		end
+	end
+	local result, defaults = 0, need("BuffsConfig").GetAllBuffs()
+	for stat, item in pairs(buckets) do
+		local default = defaults[stat] and defaults[stat].default or 1
+		local factor = (default + item.base) / math.max(default, 0.001) * item.percent * item.multiplier
+		result = result + (weights[stat] or 0.1) * math.log(math.max(0.001, factor))
+	end
+	return result
+end
+local function bestGear(inv, equipped)
+	local gear, choices = need("GearConfig"), {}
+	for _, slot in ipairs(gear.slots) do choices[slot] = {} end
+	for id, entry in pairs(inv) do
+		local cfg = gear.entries[entry.name]
+		if cfg and choices[cfg.slot] and id == entry.name and (tonumber(entry.amount) or 0) > 0 then
+			table.insert(choices[cfg.slot], entry.name)
+		end
+	end
+	for _, list in pairs(choices) do table.sort(list) end
+	local selection, best, bestScore, bestChanges, visits = {}, {}, -math.huge, math.huge, 0
+	local weights = gearWeights()
+	local function visit(index)
+		if visits >= 10000 then return end
+		if index > #gear.slots then
+			visits = visits + 1
+			local value, changes = gearSetScore(selection, gear.entries, weights), 0
+			for _, slot in ipairs(gear.slots) do if (selection[slot] or nil) ~= equipped[slot] then changes = changes + 1 end end
+			if value > bestScore + 1e-9 or math.abs(value - bestScore) <= 1e-9 and changes < bestChanges then
+				best, bestScore, bestChanges = table.clone(selection), value, changes
+			end
+			return
+		end
+		local slot = gear.slots[index]
+		local list = choices[slot]
+		if #list == 0 then selection[slot] = false; visit(index + 1)
+		else for _, name in ipairs(list) do selection[slot] = name; visit(index + 1) end end
+	end
+	visit(1)
+	return best
+end
+-- Shared deterministic need analysis. The server derives its own context and rechecks it.
+local function analyzeUnitNeeds(inv, ctx)
+	local keep, reasons, units = {}, {}, {}
+	local function retain(id, why) keep[id], reasons[id] = true, reasons[id] or why end
+	for id in pairs(ctx.inUse or {}) do retain(id, "In use") end
+	for _, id in pairs(ctx.selected or {}) do retain(id, "Reroll target") end
+	for id, entry in pairs(inv) do
+		local unit = ctx.metadata(id, entry)
+		if unit then
+			unit.damage, unit.health = ctx.score(unit.cfg, "damage", entry.attributes), ctx.score(unit.cfg, "health", entry.attributes)
+			if not unit.damage or not unit.health then retain(id, "Incomplete stats")
+			else table.insert(units, unit) end
+			local a = entry.attributes
+			local grade, trait = ctx.grades[a.grade], ctx.traits[a.trait]
+			local sPlus = ctx.grades["S+"]
+			if a.locked and not (ctx.ignoreLocks or {})[id] then retain(id, "Manual lock") end
+			if a.mutation or unit.cfg.variant or unit.cfg.limited or grade and (grade.protected
+				or sPlus and grade.order >= sPlus.order) or trait and trait.protected then retain(id, "Trophy") end
+		else retain(id, "Unknown item") end
+	end
+	local function sorted(stat)
+		local out = {}
+		for _, unit in ipairs(units) do table.insert(out, unit) end
+		table.sort(out, function(a, b) return a[stat] > b[stat] or a[stat] == b[stat] and a.id < b.id end)
+		return out
+	end
+	local slots = 0
+	for i = 1, ctx.plot.GetMaxSlots() do
+		if ctx.rebirth + 1 >= ctx.plot.GetSlotRebirthRequirement(i) then slots = slots + 1 end
+	end
+	local income, damage, health = sorted("income"), sorted("damage"), sorted("health")
+	local incomeLimit = math.min(#income, slots + 2)
+	for i = 1, incomeLimit do retain(income[i].id, "Plot and next rebirth") end
+	for i = 1, math.min(4, #damage) do retain(damage[i].id, "Combat team") end
+	for i = 1, math.min(2, #health) do retain(health[i].id, "Combat reserve") end
+	local core, fusion = {}, nil
+	for id in pairs(keep) do core[id] = true end
+	-- Reserve one useful, affordable triple. Random fusion never consumes a needed unit.
+	if ctx.fusion and ctx.fuseUtil and ctx.fuseConfig then
+		local groups, names = {}, {}
+		for i = #income, 1, -1 do
+			local unit, a = income[i], income[i].entry.attributes
+			if not keep[unit.id] and not a.locked and not a.mutation and not a.grade and not a.trait
+				and (a.level or 1) == 1 and not unit.cfg.variant and not unit.cfg.limited then
+				local name = unit.entry.name
+				if not groups[name] then groups[name] = {}; table.insert(names, name) end
+				table.insert(groups[name], unit)
+			end
+		end
+		table.sort(names)
+		local bestValue = -math.huge
+		local threshold = income[incomeLimit] and income[incomeLimit].income or 0
+		for _, name in ipairs(names) do
+			local group = groups[name]
+			if #group >= 3 then
+				local ok, plan = pcall(function()
+					local chance = 0
+					for i = 1, 3 do chance = chance + assert(ctx.fuseUtil.GetChance(group[i].entry)) end
+					local price = ctx.fuseConfig.GetCost(chance)
+					if type(price) ~= "number" or price ~= price or price < 0 or price >= math.huge
+						or price > math.max(0, ctx.cash or 0) * 0.05 then return nil end
+					local pools = ctx.fuseUtil.BuildPools(chance)
+					if type(pools) ~= "table" then return nil end
+					local gain, totalWeight = 0, 0
+					for _, pool in ipairs(pools) do
+						if type(pool.weight) ~= "number" or pool.weight < 0 or type(pool.entries) ~= "table" or #pool.entries == 0 then return nil end
+						local average = 0
+						for _, result in ipairs(pool.entries) do
+							local cfg = ctx.entries[result.name]
+							local value = ctx.score(cfg, "income", {mutation = result.mutation})
+							if not value then return nil end
+							average = average + math.max(0, value - threshold)
+						end
+						gain, totalWeight = gain + pool.weight * average / #pool.entries, totalWeight + pool.weight
+					end
+					if totalWeight <= 0 then return nil end
+					gain = gain / totalWeight * (ctx.moneyMultiplier or 1)
+					if gain <= 0 or gain ~= gain or gain >= math.huge or price / gain > 300 then return nil end
+					return {ids = {group[1].id, group[2].id, group[3].id}, price = price, gain = gain}
+				end)
+				if ok and plan and plan.gain / math.max(1, plan.price) > bestValue then
+					fusion, bestValue = plan, plan.gain / math.max(1, plan.price)
+				elseif not ok and not fusion then
+					-- Retain uncertain inputs; a missing/broken pool must not turn them into trash.
+					for i = 1, 3 do retain(group[i].id, "Unverified fusion") end
+				end
+			end
+		end
+	end
+	if fusion then for _, id in ipairs(fusion.ids) do retain(id, "Fusion reserve") end end
+	local trash = {}
+	for i = #income, 1, -1 do if not keep[income[i].id] then table.insert(trash, income[i]) end end
+	return {keep = keep, core = core, reasons = reasons, trash = trash, income = income, damage = damage,
+		fusion = fusion, plotReserve = incomeLimit, kept = #units - #trash}
+end
+
+local function unlockedSlots()
+	local cfg, rebirth = need("Plot"), read("Rebirth")
+	assert(type(rebirth) == "number", "Waiting for rebirth data.")
+	local result = {}
+	for i = 1, cfg.GetMaxSlots() do
+		if rebirth >= cfg.GetSlotRebirthRequirement(i) then table.insert(result, i) end
+	end
+	return result
+end
+-- An InvokeServer timeout is not cancellation. Wait for outstanding inventory writes.
+local function inventoryRequestPending()
+	if app.settleRerolls then app.settleRerolls() end
+	local requests = app.requests or {}
+	return requests["SellService/SellInventory"] ~= nil
+		or requests["GearService/SpixSalvageGear"] ~= nil
+		or requests["SpixAutomation/WeatherReroll"] ~= nil
+		or next(app.rerollPending or {}) ~= nil
+end
+local function unitNeeds(inv, ignoreSpareLocks)
+	local inUse, selected, pending = {}, {}, {}
+	local slots, team, rebirth = read("Slots"), read("TowerTeam"), read("Rebirth")
+	assert(type(slots) == "table" and type(team) == "table" and type(rebirth) == "number", "Waiting for your roster.")
+	for _, slot in pairs(slots) do if slot.unitId then inUse[slot.unitId] = true end end
+	for _, id in pairs(team) do if id then inUse[id] = true end end
+	if app.props.EquippedUnit then inUse[app.props.EquippedUnit] = true end
+	-- Only hold unresolved new arrivals; continuous rolls must not block older spares.
+	for _, reservation in ipairs(app.rollReservations or {}) do
+		if (reservation.remaining or 0) > 0 then
+			for id in pairs(inv) do
+				if not inUse[id] and not (reservation.baseline or {})[id] and not (app.rollClaims or {})[id] then
+					inUse[id], pending[id] = true, true
+				end
+			end
+		end
+	end
+	for _, key in ipairs({"Traits", "Grades"}) do
+		if app.flags[key] then
+			local plan = app.rerollTargets and app.rerollTargets[key]
+			local id = plan and plan.id
+			if id then table.insert(selected, id) end
+		end
+	end
+	local ignoreLocks = app.ownedLocks
+	if ignoreSpareLocks then
+		ignoreLocks = {}
+		for id in pairs(inv) do ignoreLocks[id] = true end
+	end
+	local needs = analyzeUnitNeeds(inv, {metadata = unitMetadata, score = score, entries = need("Units").entries,
+		grades = need("Grades"), traits = need("Traits"), plot = need("Plot"), rebirth = rebirth,
+		inUse = inUse, selected = selected, ignoreLocks = ignoreLocks,
+		fusion = app.flags.Fuse == true, fuseUtil = app.modules.FuseUtil, fuseConfig = app.modules.FuseConfig,
+		cash = math.max(0, (cash() or 0) - app.options.cashReserve), moneyMultiplier = buff("Money Multiplier", 1)})
+	for id in pairs(pending) do needs.reasons[id] = "Pending roll" end
+	return needs
+end
+-- Sale policy is independent of progression/fusion reserves and inventory lock flags.
+local function saleNeeds(inv)
+	local needs = unitNeeds(inv, true)
+	local keep, reasons = {}, {}
+	local function retain(id, why) keep[id], reasons[id] = true, reasons[id] or why end
+	for id, why in pairs(needs.reasons) do
+		if why == "In use" or why == "Reroll target" or why == "Pending roll"
+			or why == "Unknown item" or why == "Incomplete stats" then retain(id, why) end
+	end
+	-- Rank by actual stats; rarity, size, mutation and grade grant no exemption.
+	for i = 1, math.min(#needs.income, math.max(1, #unlockedSlots())) do
+		retain(needs.income[i].id, "Best plot units")
+	end
+	for i = 1, math.min(4, #needs.damage) do
+		if needs.damage[i].damage > 0 then retain(needs.damage[i].id, "Best combat units") end
+	end
+	local trash = {}
+	for i = #needs.income, 1, -1 do
+		local unit = needs.income[i]
+		local arrived = app.unitWatch.queue[unit.id]
+		if arrived and os.clock() - arrived < 2 then retain(unit.id, "Pending roll") end
+		if not keep[unit.id] then table.insert(trash, unit) end
+	end
+	return {keep = keep, reasons = reasons, trash = trash}
+end
+local function protection(inv, allowFusion)
+	local protected, locks = {}, {}
+	local grades, traits = need("Grades"), need("Traits")
+	local slots, team = read("Slots"), read("TowerTeam")
+	assert(type(slots) == "table" and type(team) == "table", "Waiting for slot and team data.")
+	for _, slot in pairs(slots) do if slot.unitId then protected[slot.unitId] = true end end
+	for _, id in pairs(team) do if id then protected[id] = true end end
+	if app.props.EquippedUnit then protected[app.props.EquippedUnit] = true end
+	for _, key in ipairs({"Traits", "Grades"}) do
+		local plan = app.rerollTargets and app.rerollTargets[key]
+		if app.flags[key] and plan then protected[plan.id] = true end
+	end
+	if app.flags.SmartSell or app.flags.Overflow or app.flags.Kaitun then
+		local needs = unitNeeds(inv)
+		local fusionInputs = {}
+		if allowFusion and needs.fusion then for _, id in ipairs(needs.fusion.ids) do fusionInputs[id] = true end end
+		for id in pairs(needs.keep) do
+			if not fusionInputs[id] or needs.core[id] then protected[id] = true end
+		end
+		-- Needed, pending and incomplete units are protected in memory, never auto-locked.
+	elseif app.flags.KeepBest then
+		local limit = math.max(math.floor(app.options.keepCount), #unlockedSlots())
+		for i, unit in ipairs(ranked(inv, "income")) do if i <= limit then protected[unit.id] = true end end
+		for i, unit in ipairs(ranked(inv, "damage")) do if i <= 4 then protected[unit.id] = true end end
+	end
+	for id, entry in pairs(inv) do
+		local a = entry.attributes or {}
+		local grade = grades[a.grade]
+		local trait = traits[a.trait]
+		if a.locked or app.flags.KeepMutations and a.mutation or grade and grade.protected or trait and trait.protected then protected[id] = true end
+		local cfg = config(entry)
+		local sPlus = grades["S+"]
+		local exception = cfg and (a.mutation or cfg.variant or cfg.limited
+			or grade and sPlus and grade.order >= sPlus.order)
+		if exception and (app.flags.RareProtection or app.flags.SmartSell or app.flags.Overflow) then
+			protected[id] = true
+		end
+	end
+	if app.flags.SmartSell or app.flags.Overflow then
+		for id in pairs(saleNeeds(inv).keep) do protected[id] = true end
+	end
+	return protected, locks
+end
+local function syncLocks(inv)
+	if read("PendingTrade") then return end
+	local nativeThreshold = read("AutoSell")
+	if app.flags.KeepBest or app.flags.KeepMutations or app.flags.RareProtection or app.flags.SmartSell or app.flags.Overflow
+		or app.flags.Sell or app.flags.AutoRoll or app.flags.Lucky or app.flags.Jackpot or app.flags.Traits or app.flags.Grades then
+		if type(nativeThreshold) == "number" and nativeThreshold > 0 then
+			if app.nativeSell == nil then app.nativeSell = nativeThreshold end
+			fire("SellService", "UpdateAutoSell", 0)
+		end
+	elseif app.nativeSell ~= nil then
+		fire("SellService", "UpdateAutoSell", app.nativeSell); app.nativeSell = nil
+	end
+	-- Safeguards are evaluated by sell/fusion selection. Never create inventory locks.
+	-- Release only locks explicitly recorded as owned by this running hub.
+	local changes = {}
+	for id in pairs(app.ownedLocks) do
+		if not inv[id] or not (inv[id].attributes or {}).locked then app.ownedLocks[id] = nil
+		else changes[id] = false end
+	end
+	if next(changes) then fire("UnitService", "SetLocked", changes); task.wait(0.25) end
+	report("KeepBest", app.flags.KeepBest and "Protecting your best income and damage units."
+		or (app.flags.SmartSell or app.flags.Overflow) and "Inventory safeguards are keeping your best units." or "Best-unit protection is off.")
+	report("RareProtection", (app.flags.SmartSell or app.flags.Overflow) and "Smart Sell keeps the best stats; rarity adds no protection."
+		or app.flags.RareProtection and "Rare units are kept from filtered sales and fusion." or "Extra rare-unit protection is off.")
+end
+local function tokenAmount(inv, name)
+	local amount = 0
+	for _, entry in pairs(inv) do if entry.name == name then amount = amount + (tonumber(entry.amount) or 0) end end
+	return amount
+end
+local function nativeRoll(enabled)
+	if enabled then
+		if app.nativeRoll == nil and type(read("AutoRoll")) == "boolean" then app.nativeRoll = read("AutoRoll") end
+		if read("AutoRoll") then fire("RollService", "SetAutoRoll", false) end
+	elseif app.nativeRoll ~= nil then
+		fire("RollService", "SetAutoRoll", app.nativeRoll); app.nativeRoll = nil
+	end
+end
+local kaitunTargets = {
+	AutoRoll = true, FastRoll = true, SkipAnimation = true, Collect = true, Rebirth = true,
+	BuyDice = true, EquipDice = true, Place = true, Team = true, Level = true, Upgrades = true,
+	Quests = true, Gear = true, KeepBest = true, KeepMutations = true, AntiAFK = true, Tower = true,
+	Lucky = true, Jackpot = true, Fuse = true, Sell = false, Traits = true, Grades = true,
+	SmartSell = true, Overflow = true, RareProtection = true, WeatherReroll = false,
+}
+local function predictedFloors(cfg, units)
+	local team = {}
+	for i = 1, math.min(4, #units) do
+		local unit = units[i]
+		local health = score(unit.cfg, "health", unit.entry.attributes)
+		if health and health > 0 and unit.value > 0 then
+			table.insert(team, {damage = unit.value * buff("Damage Multiplier", 1), health = health * buff("Health Multiplier", 1)})
+		end
+	end
+	local member, cleared = 1, 0
+	for floor = 1, math.min(cfg.maxFloors or 100, 200) do
+		local health, damage = cfg.enemyHealth(floor), cfg.enemyDamage(floor)
+		if type(health) ~= "number" or type(damage) ~= "number" or health <= 0 or damage <= 0 then return cleared end
+		while health > 0 do
+			local unit = team[member]
+			if not unit then return cleared end
+			local toKill, beforeDeath = math.ceil(health / unit.damage), math.ceil(unit.health / damage)
+			if toKill <= beforeDeath then
+				unit.health = unit.health - (toKill - 1) * damage
+				health = 0
+			else health = health - beforeDeath * unit.damage; member = member + 1 end
+		end
+		cleared = floor
+	end
+	return cleared
+end
+local function bestRerollTarget(key, role)
+	local entries = need(key == "Traits" and "Traits" or "Grades")
+	local stat = key == "Traits" and role .. "Multiplier" or "incomeMultiplier"
+	local best, multiplier, order = nil, 0, -math.huge
+	for name, cfg in pairs(entries) do
+		local weight, value = cfg.weight, cfg[stat] or 1
+		if type(weight) == "number" and weight > 0 and weight < math.huge
+			and type(value) == "number" and value > 0 and value < math.huge then
+			local rank = tonumber(cfg.order) or 0
+			if value > multiplier or value == multiplier and (rank > order or rank == order and (not best or name < best)) then
+				best, multiplier, order = name, value, rank
+			end
+		end
+	end
+	if best then return {target = best, role = role, multiplier = multiplier} end
+end
+local function rerollReached(key, entry, plan)
+	local field = key == "Traits" and "trait" or "grade"
+	local cfg = need(key == "Traits" and "Traits" or "Grades")[(entry.attributes or {})[field]]
+	local value = cfg and (cfg[key == "Traits" and plan.role .. "Multiplier" or "incomeMultiplier"] or 1)
+	-- Equivalent or stronger exclusive results also count; never reroll a finished unit.
+	return type(value) == "number" and value >= plan.multiplier
+end
+local function autoRerollPlans(inv)
+	local plans = {}
+	app.rerollTargets = app.rerollTargets or {}
+	local units, slots = ranked(inv, "income"), #unlockedSlots()
+	local candidates, seen = {}, {}
+	for i = 1, math.min(slots, #units) do
+		if unitMetadata(units[i].id, units[i].entry) then
+			table.insert(candidates, {unit = units[i], role = "income"}); seen[units[i].id] = true
+		end
+	end
+	for i, unit in ipairs(ranked(inv, "damage")) do
+		if i <= 4 and unit.value > 0 and not seen[unit.id] and unitMetadata(unit.id, unit.entry) then
+			table.insert(candidates, {unit = unit, role = "damage"}); seen[unit.id] = true
+		end
+	end
+	-- Preserve level, mutation and size while comparing potential without the rerolled stats.
+	for _, candidate in ipairs(candidates) do
+		local attributes = {}
+		for name, value in pairs(candidate.unit.entry.attributes) do attributes[name] = value end
+		attributes.trait, attributes.grade = nil, nil
+		candidate.potential = score(candidate.unit.cfg, candidate.role, attributes) or 0
+	end
+	table.sort(candidates, function(a, b)
+		return a.potential > b.potential or a.potential == b.potential and a.unit.id < b.unit.id
+	end)
+	for _, key in ipairs({"Traits", "Grades"}) do
+		local pin = app.rerollTargets[key]
+		local entry = pin and inv[pin.id]
+		local plan = pin and bestRerollTarget(key, pin.role)
+		if not app.flags[key] or not entry then
+			app.rerollTargets[key] = nil
+		elseif plan and unitMetadata(pin.id, entry) and rerollReached(key, entry, plan) then
+			app.rerollTargets[key] = nil
+		end
+		local token = key == "Traits" and "Trait Reroll" or "Gems"
+		if app.flags[key] and app.budget[key] < math.floor(app.options.rerollLimit)
+			and tokenAmount(inv, token) - 1 >= app.options.tokenReserve then
+			pin = app.rerollTargets[key]
+			entry = pin and inv[pin.id]
+			plan = pin and bestRerollTarget(key, pin.role)
+			if pin then
+				-- A downgrade must not change targets midway or release the unit to Auto Sell.
+				if plan and unitMetadata(pin.id, entry) then plan.id = pin.id; plans[key] = plan end
+			else
+				for _, candidate in ipairs(candidates) do
+					-- Grades boost income only in this game; spend Gems on plot units.
+					if key == "Traits" or candidate.role == "income" then
+						plan = bestRerollTarget(key, candidate.role)
+						if plan and not rerollReached(key, candidate.unit.entry, plan) then
+							plan.id = candidate.unit.id; plans[key] = plan; break
+						end
+					end
+				end
+			end
+			if plans[key] then app.rerollTargets[key] = plans[key] end
+		end
+	end
+	return plans
+end
+local function settleNativeRerolls(inv)
+	inv = inv or inventory()
+	if not inv then return end
+	for key, pending in pairs(app.rerollPending or {}) do
+		local entry = inv[pending.id]
+		local spent = tokenAmount(inv, pending.token) < pending.before
+			or entry and type(entry.attributes) == "table" and entry.attributes[pending.field] ~= pending.original
+		if spent or not entry then
+			if spent and (app.rerollEpoch and app.rerollEpoch[key] or 0) == pending.epoch then
+				app.budget[key] = app.budget[key] + 1
+			end
+			app.rerollPending[key] = nil
+		elseif os.clock() - pending.startedAt >= 10 then
+			-- Signals have no acknowledgement. Allow a slow retry after a bounded wait.
+			app.rerollPending[key] = nil
+			if app.flags[key] then report(key, "No reroll confirmed. Rechecking your unit and tokens.") end
+		end
+	end
+end
+app.settleRerolls = function() settleNativeRerolls() end
+local function kaitunOwnedDice()
+	local dice, owned = need("Dice"), read("OwnedDice")
+	assert(type(owned) == "table", "Waiting for owned dice.")
+	local equipped = read("Dice")
+	local current = dice.Get(equipped)
+	local best, luck = equipped, current and current.luck or 0
+	for id, cfg in pairs(dice.GetAll()) do
+		if owned[id] and (cfg.luck > luck or cfg.luck == luck and (not best or id < best)) then best, luck = id, cfg.luck end
+	end
+	return best, luck
+end
+local function kaitunCashPlan(inv, income)
+	local best, choice, value = nil, nil, -math.huge
+	local function consider(action, price, utility, id, payback)
+		if not readyToSpend(price) or utility <= 0 or utility ~= utility or utility >= math.huge then return end
+		if payback and (payback > app.options.maxPayback or payback >= (app.kaitun.rebirthETA or math.huge)) then return end
+		local scoreValue = utility / math.max(1, price)
+		if scoreValue > value or scoreValue == value and tostring(id) < tostring(choice) then best, choice, value = action, id, scoreValue end
+	end
+	local owned, tree = read("Upgrades"), need("Tree")
+	assert(type(owned) == "table", "Waiting for upgrades.")
+	for id, cfg in pairs(need("Upgrades")) do
+		local parent = tree.GetParent(id)
+		if id ~= "Start" and not owned[id] and (not parent or parent == "Start" or owned[parent]) then
+			local utility, moneyGain = 0, 0
+			for stat, bonus in pairs(cfg.buffs or {}) do
+				local amount, current = bonus.amount or 0, buff(stat, 1)
+				local relative = bonus.bucket == "multiplier" and amount - 1 or amount / math.max(current, 0.001)
+				local weight = stat == "Money Multiplier" and 8 or stat == "Luck" and 6 or stat == "Roll Duration" and 5 or 0.25
+				if stat == "Unit Storage" then
+					weight = app.kaitun.spaceLow and 20 or 2
+					utility = utility + weight * math.max(0, relative)
+				elseif stat == "Roll Duration" then utility = utility + weight * math.max(0, -relative)
+				else utility = utility + weight * math.max(0, relative) end
+				if stat == "Money Multiplier" then moneyGain = income * math.max(0, relative) end
+			end
+			consider("Upgrades", cfg.price, utility, id, moneyGain > 0 and cfg.price / moneyGain or nil)
+		end
+	end
+	local dice, ownedDice = need("Dice"), read("OwnedDice")
+	local bestOwned, ownedLuck = kaitunOwnedDice()
+	-- An already-owned upgrade costs nothing; equip it before considering a purchase.
+	if bestOwned == read("Dice") then
+		for id, cfg in pairs(dice.GetAll()) do
+			if cfg.price and not ownedDice[id] and cfg.luck > ownedLuck then
+				consider("BuyDice", cfg.price, 6 * math.log(cfg.luck / math.max(1, ownedLuck)), id)
+			end
+		end
+	end
+	for _, i in ipairs(unlockedSlots()) do
+		local slots = read("Slots") or {}
+		local slot = slots[tostring(i)] or slots[i]
+		local entry = slot and inv[slot.unitId]
+		if config(entry) and not app.kaitun.needsPlacement then
+			local cfg, attrs = config(entry), entry.attributes or {}
+			local upgraded = table.clone(attrs); upgraded.level = (attrs.level or 1) + 1
+			local old, new = score(cfg, "income", attrs), score(cfg, "income", upgraded)
+			local price = need("UnitUtil").GetLevelPrice(entry.name, attrs)
+			local gain = old and new and (new - old) * buff("Money Multiplier", 1) or 0
+			if gain > 0 and type(price) == "number" then consider("Level", price, 8 * gain / math.max(1, income), i, price / gain) end
+		end
+	end
+	-- Smart Sell owns spare units. Never allocate cash to a triple it will sell.
+	if not app.flags.SmartSell and not app.flags.Overflow then
+		local needs = unitNeeds(inv)
+		if needs.fusion then consider("Fuse", needs.fusion.price, math.min(0.1, needs.fusion.gain / math.max(1, income))) end
+	end
+	return best, choice
+end
+local function updateKaitun()
+	if not app.flags.Kaitun then return end
+	app.kaitun.ready, app.kaitun.cashAction, app.kaitun.cashChoice = false, nil, nil
+	for _, name in ipairs({"Data", "Buffs", "Units", "Plot", "Dice", "Rebirths", "Upgrades", "Tree", "Grades", "Traits", "UnitUtil"}) do
+		if not app.modules[name] then report("Kaitun", "Waiting for " .. name .. " data."); return end
+	end
+	local inv, balance, rebirth, slots, team = inventory(), cash(), read("Rebirth"), read("Slots"), read("TowerTeam")
+	assert(inv and balance and type(rebirth) == "number" and type(slots) == "table" and type(team) == "table", "Waiting for your profile.")
+	local income, banked, current, wanted = 0, 0, {}, {}
+	local units, indices = ranked(inv, "income"), unlockedSlots()
+	for index, i in ipairs(indices) do
+		local slot = slots[tostring(i)] or slots[i]
+		if slot then
+			local entry = inv[slot.unitId]
+			income = income + (score(config(entry), "income", entry and entry.attributes) or 0)
+			if type(slot.balance) == "number" and slot.balance > 0 and slot.balance < math.huge then banked = banked + slot.balance end
+			if slot.unitId then current[slot.unitId] = true end
+		end
+		if units[index] then wanted[units[index].id] = true end
+	end
+	income = income * buff("Money Multiplier", 1)
+	app.kaitun.needsPlacement = false
+	for id in pairs(wanted) do if not current[id] then app.kaitun.needsPlacement = true end end
+	for id in pairs(current) do if not wanted[id] then app.kaitun.needsPlacement = true end end
+	local combat = ranked(inv, "damage")
+	app.kaitun.needsTeam = false
+	for i = 1, 4 do if (team[i] or team[tostring(i)]) ~= (combat[i] and combat[i].id) then app.kaitun.needsTeam = true end end
+	app.kaitun.bestDice = kaitunOwnedDice()
+	local count, pending, capacity = unitCount(inv), pendingRollUnits(inv), math.floor(buff("Unit Storage", 100))
+	app.kaitun.spaceLow = count + pending + math.floor(buff("Rolls", 1)) > capacity or count >= math.ceil(capacity * 0.85)
+	local nextRebirth = need("Rebirths").GetNext(rebirth)
+	local shortfall = nextRebirth and math.max(0, nextRebirth.cost - balance - banked) or math.huge
+	app.kaitun.rebirthETA = shortfall == 0 and 0 or income > 0 and shortfall / income or math.huge
+	app.kaitun.saving = nextRebirth ~= nil and (shortfall == 0 or app.kaitun.rebirthETA <= 12)
+	app.kaitun.ready = true
+	app.kaitun.rerolls = autoRerollPlans(inv)
+	if not app.kaitun.saving then app.kaitun.cashAction, app.kaitun.cashChoice = kaitunCashPlan(inv, income) end
+	local phase = "Farming income and rolls"
+	if #units == 0 then phase = "Rolling your first units"
+	elseif app.kaitun.needsPlacement then phase = "Placing best income units"
+	elseif app.kaitun.spaceLow then phase = "Clearing space for more rolls"
+	elseif app.kaitun.saving then phase = balance >= nextRebirth.cost and "Ready to rebirth" or "Collecting cash for rebirth"
+	elseif app.kaitun.bestDice ~= read("Dice") then phase = "Equipping best owned dice"
+	elseif app.kaitun.cashAction then phase = "Improving " .. (app.kaitun.cashAction == "Level" and "plot income" or tostring(app.kaitun.cashChoice)) end
+	app.kaitun.phase = phase
+	-- Towers and gear are optional: missing extensions never stop core farming.
+	if app.modules.Towers and not app.tower.owned and os.clock() >= (app.kaitun.towerCheck or 0) then
+		local best, bestPriority, bestFloors = nil, -math.huge, 0
+		for id, cfg in pairs(need("Towers").GetAll()) do
+			local floors = predictedFloors(cfg, combat)
+			local priority = cfg.maxFloors and floors >= cfg.maxFloors and 1000 + (cfg.order or 0) or floors
+			if floors > 0 and (priority > bestPriority or priority == bestPriority and (not best or id < best)) then best, bestPriority, bestFloors = id, priority, floors end
+		end
+		app.options.towerId, app.kaitun.towerFloors = best, bestFloors
+		app.kaitun.towerCheck = os.clock() + 5
+	end
+	report("Kaitun", phase .. " · rebirth " .. rebirth .. "\n" .. compact(income) .. "/s · " .. count .. "/" .. capacity .. " units")
+end
+local function kaitunActionReady(key)
+	if not app.flags.Kaitun then return true end
+	if app.kaitun.ready == false then return key == "EquipDice" end
+	if key == "Place" then return app.kaitun.needsPlacement ~= false end
+	if key == "Team" then return app.kaitun.needsTeam ~= false end
+	if key == "EquipDice" then return app.kaitun.bestDice ~= read("Dice") end
+	if key == "Traits" or key == "Grades" then return app.kaitun.rerolls and app.kaitun.rerolls[key] ~= nil end
+	if key == "BuyDice" or key == "Level" or key == "Upgrades" or key == "Fuse" then return app.kaitun.cashAction == key and not app.kaitun.saving end
+	return true
+end
+local function actionRetryDelay(key, success, standard)
+	app.failures[key] = success and 0 or math.min(5, (app.failures[key] or 0) + 1)
+	return success and standard or math.min(30, 2 ^ app.failures[key])
+end
+app.onToggle = function(key, enabled)
+	if key == "Kaitun" then
+		if enabled and not app.kaitun.saved then
+			local saved = {}
+			for name in pairs(kaitunTargets) do saved[name] = app.flags[name] == true end
+			app.kaitun.saved, app.kaitun.towerId = saved, app.options.towerId
+			app.kaitun.rerolls, app.kaitun.cashAction = {}, nil
+			app.kaitun.saving, app.kaitun.towerCheck, app.kaitun.ready = false, 0, false
+			for name, value in pairs(kaitunTargets) do toggle(name, value, true) end
+			report(key, "All progression workers are managed. Manual toggles take over.")
+		elseif not enabled and app.kaitun.saved then
+			local saved = app.kaitun.saved
+			app.kaitun.saved, app.kaitun.saving, app.kaitun.ready = nil, false, nil
+			app.options.towerId = app.kaitun.towerId
+			app.kaitun.rerolls, app.kaitun.cashAction = {}, nil
+			for name, value in pairs(saved) do toggle(name, value, true) end
+			report(key, "Paused. Your previous toggles were restored.")
+		end
+	elseif key == "Traits" or key == "Grades" then
+		app.rerollTargets = app.rerollTargets or {}
+		app.rerollTargets[key] = nil
+	elseif key == "AutoRoll" then
+		pcall(nativeRoll, enabled or app.flags.Lucky or app.flags.Jackpot)
+	elseif key == "Tower" then
+		if enabled then app.tower.stopping = false
+		else app.tower.stopping = app.tower.owned end
+	elseif key == "Sell" then
+		if enabled then
+			if app.nativeSell == nil then app.nativeSell = read("AutoSell") end
+			pcall(fire, "SellService", "UpdateAutoSell", 0)
+		end
+		-- syncLocks restores native Auto Sell only after every protected worker is off.
+	elseif key == "AntiAFK" then
+		report(key, enabled and "Watching for idle. Built-in AFK rejoin remains active." or "Paused")
+	elseif key == "Overflow" then
+		if not enabled then app.overflowActive = false end
+	elseif key == "SmartSell" then
+		app.overflowActive = false
+		report(key, enabled and "Keeping your best income and combat units. Selling weaker units of any rarity." or "Paused")
+
+	end
+end
+
+local function recordUnitArrival(id)
+	if not app.alive or type(id) ~= "string" then return end
+	local watch = app.unitWatch
+	if watch.initialized and not watch.known[id] then watch.queue[id] = os.clock() end
+	watch.known[id] = true
+end
+local function observeInventory(inv)
+	local watch = app.unitWatch
+	if not watch.initialized then
+		for id in pairs(inv) do watch.known[id] = true end
+		watch.initialized = true
+		return
+	end
+	for id in pairs(inv) do recordUnitArrival(id) end
+	for id in pairs(watch.known) do if not inv[id] then watch.known[id], watch.queue[id] = nil, nil end end
+end
+local function protectionSummary(inv, needs)
+	local counts = {locked = 0, trophies = 0, needed = 0, pending = 0, fusion = 0, unknown = 0}
+	for id, why in pairs(needs.reasons) do
+		if config(inv[id]) then
+			local key = why == "Manual lock" and "locked" or why == "Trophy" and "trophies"
+				or why == "Pending roll" and "pending" or (why == "Fusion reserve" or why == "Unverified fusion") and "fusion"
+				or (why == "Unknown item" or why == "Incomplete stats") and "unknown" or "needed"
+			counts[key] = counts[key] + 1
+		end
+	end
+	local parts = {}
+	for _, key in ipairs({"locked", "trophies", "needed", "pending", "fusion", "unknown"}) do
+		if counts[key] > 0 then table.insert(parts, counts[key] .. " " .. key) end
+	end
+	return #parts > 0 and table.concat(parts, " · ") or "New units are still settling."
+end
+local function unlockLowIncomeSpares()
+	if inventoryRequestPending() then unlockSpareStatus.Text = "Waiting for the current inventory request."; return end
+	if read("PendingTrade") or app.travel.pausing then
+		unlockSpareStatus.Text = "Waiting for your trade or teleport to finish."; return
+	end
+	if not app.props.EquippedUnitReady then unlockSpareStatus.Text = "Waiting for your roster."; return end
+	local inv = assert(inventory(), "Waiting for inventory.")
+	pendingRollUnits(inv)
+	local needs, changes, count = saleNeeds(inv), {}, 0
+	for _, unit in ipairs(needs.trash) do
+		if unit.entry.attributes.locked then
+			changes[unit.id], count = false, count + 1
+			if count >= 100 then break end
+		end
+	end
+	if count == 0 then
+		app.unlockSpareRequested = false
+		unlockSpareStatus.Text = (app.unlockSpareTotal or 0) > 0 and ("Unlocked " .. app.unlockSpareTotal .. " spares. Cleanup can continue.")
+			or ("No weak locks to clear. " .. protectionSummary(inv, needs))
+		return
+	end
+	app.unlockSpareAttempts = (app.unlockSpareAttempts or 0) + 1
+	fire("UnitService", "SetLocked", changes)
+	local changed = waitForChange(function()
+		local current = inventory() or {}
+		for id in pairs(changes) do if current[id] and (current[id].attributes or {}).locked then return false end end
+		return true
+	end, 2)
+	if changed then
+		for id in pairs(changes) do app.ownedLocks[id] = nil end
+		app.unlockSpareTotal = (app.unlockSpareTotal or 0) + count
+		app.unlockSpareAttempts = 0
+		unlockSpareStatus.Text = "Unlocked " .. app.unlockSpareTotal .. " spares. Checking remaining locks."
+	elseif app.unlockSpareAttempts >= 3 then
+		app.unlockSpareRequested = false
+		unlockSpareStatus.Text = "The game did not confirm the unlock. Try again after current actions finish."
+	end
+end
+local function overflowGoal(count, capacity)
+	if not app.flags.Overflow or app.flags.SmartSell then app.overflowActive = false; return nil end
+	if count >= math.ceil(capacity * 0.95) then app.overflowActive = true end
+	local target = math.max(1, math.floor(capacity * 0.8))
+	if not app.overflowActive or count <= target then app.overflowActive = false; return nil end
+	return target
+end
+local function inventorySweep()
+	if inventoryRequestPending() then report("SmartSell", "Waiting for the current inventory request."); return end
+	local inv = assert(inventory(), "Waiting for inventory.")
+	observeInventory(inv)
+	pendingRollUnits(inv)
+	if app.inventoryBusy or app.travel.pausing or read("PendingTrade") then return end
+	if not app.props.EquippedUnitReady then
+		report("SmartSell", "Waiting for your roster."); return
+	end
+	local needs, ids, reason = saleNeeds(inv), {}, nil
+	local capacity, count = math.floor(buff("Unit Storage", 100)), unitCount(inv)
+	local target = overflowGoal(count, capacity)
+	if app.flags.SmartSell or target then
+		reason = app.flags.SmartSell and "Smart" or "Overflow"
+		local limit = math.min(100, target and count - target or 100)
+		for _, unit in ipairs(needs.trash) do
+			table.insert(ids, unit.id)
+			if #ids >= limit then break end
+		end
+	end
+
+	if #ids == 0 then
+		if app.flags.SmartSell then report("SmartSell", "Kept: " .. protectionSummary(inv, needs)) end
+		if app.flags.Overflow then report("Overflow", "Storage " .. count .. " / " .. capacity .. " · threshold 95%") end
+		return
+	end
+	local key = reason == "Overflow" and "Overflow" or "SmartSell"
+	if app.travel.pausing or read("PendingTrade") or not app.alive then return end
+	-- Native selling refuses locked units. Clear only this verified nonvaluable batch.
+	local unlock = {}
+	for _, id in ipairs(ids) do
+		if (inv[id].attributes or {}).locked then unlock[id] = false end
+	end
+	if next(unlock) then
+		fire("UnitService", "SetLocked", unlock)
+		waitForChange(function()
+			local current = inventory() or {}
+			for id in pairs(unlock) do
+				if current[id] and (current[id].attributes or {}).locked then return false end
+			end
+			return true
+		end, 2)
+	end
+	-- Unlock confirmation yields: recheck value, roster, trade and toggles before selling.
+	if not app.alive or app.travel.pausing or read("PendingTrade") or not app.props.EquippedUnitReady
+		or not (app.flags.SmartSell or app.flags.Overflow) then return end
+	local current = assert(inventory(), "Waiting for inventory.")
+	pendingRollUnits(current)
+	local fresh, eligible, confirmed = saleNeeds(current), {}, {}
+	for _, unit in ipairs(fresh.trash) do eligible[unit.id] = true end
+	local remaining = math.huge
+	if not app.flags.SmartSell then
+		local currentCapacity = math.floor(buff("Unit Storage", 100))
+		local currentCount = unitCount(current)
+		local target = overflowGoal(currentCount, currentCapacity)
+		if not target then return end
+		remaining = currentCount - target
+	end
+	for _, id in ipairs(ids) do
+		if eligible[id] and current[id] and not (current[id].attributes or {}).locked and #confirmed < remaining then
+			table.insert(confirmed, id)
+		end
+	end
+	ids = confirmed
+	if #ids == 0 then report(key, "Waiting for unlocks or changes to unit value."); return end
+	local earned, sold = invoke("SellService", "SellInventory", ids)
+	if type(earned) == "number" and earned >= 0 and earned < math.huge and type(sold) == "number"
+		and sold >= 0 and sold <= #ids and sold % 1 == 0 then
+		if sold > 0 then
+			waitForChange(function()
+				local current, missing = inventory() or {}, 0
+				for _, id in ipairs(ids) do if not current[id] then missing = missing + 1 end end
+				return missing >= sold
+			end, 1)
+			local current = inventory() or {}
+			for _, id in ipairs(ids) do if not current[id] then app.unitWatch.queue[id] = nil end end
+			report(key, "Sold " .. sold .. " weaker units · earned " .. compact(earned) .. " cash.")
+		else report(key, "No sale confirmed. Checking your remaining spares.") end
+	else report(key, "Waiting for the game's sale confirmation.", true) end
+end
+task.spawn(function()
+	while app.alive do
+		if (app.flags.SmartSell or app.flags.Overflow or app.unlockSpareRequested) and inventory() and app.modules.Units
+			and not app.inventoryBusy and not app.inventoryOwner and not inventoryRequestPending() and os.clock() >= (app.inventoryNext or 0) then
+			local ok, err = pcall(function()
+				app.inventoryOwner = "Sweep"
+				if app.unlockSpareRequested then unlockLowIncomeSpares() else inventorySweep() end
+			end)
+			app.inventoryOwner = nil
+			app.inventoryNext = os.clock() + (ok and 0.4 or 2)
+			if not ok then report(app.flags.Overflow and "Overflow" or "SmartSell", tostring(err):sub(1, 150), true) end
+		end
+		task.wait(0.1)
+	end
+end)
+
+-- Inventory sweeps and the action worker share ownership; collection and rolls are independent.
+task.spawn(function()
+	while app.alive do
+		if app.flags.Collect and inventory() then
+			local ok, err = pcall(function()
+				local slots = read("Slots") or {}
+				local count = 0
+				for _, i in ipairs(unlockedSlots()) do
+					local slot = slots[tostring(i)] or slots[i]
+					if slot and tonumber(slot.balance) and slot.balance > 0 then
+						fire("PlotService", "CollectBalance", i); count = count + 1
+					end
+				end
+				report("Collect", "Collected " .. count .. " slot balance(s).")
+			end)
+			if not ok then report("Collect", tostring(err):sub(1, 150), true) end
+		end
+		task.wait(0.4)
+	end
+end)
+local function prepareSpin(inv)
+	local function isActive(name)
+		for _, entry in pairs(read("ActiveEntries") or {}) do
+			if entry.name == name and (tonumber(entry.amount) or 1) > 0 then return true end
+		end
+		return false
+	end
+	if app.spinPending then
+		if isActive(app.spinPending.name) then app.spinPending = nil; return true, false end
+		if os.clock() - app.spinPending.startedAt < 10 then return false, true end
+		app.spinPending = nil
+	end
+	local active = read("ActiveEntries") or {}
+	for _, entry in pairs(active) do
+		if (entry.name == "Lucky Spin" or entry.name == "Jackpot Spin") and (tonumber(entry.amount) or 1) > 0 then return true, false end
+	end
+	local key = app.flags.Jackpot and tokenAmount(inv, "Jackpot Spin") > 0 and "Jackpot Spin"
+		or app.flags.Lucky and tokenAmount(inv, "Lucky Spin") > 0 and "Lucky Spin" or nil
+	if key then
+		for id, entry in pairs(inv) do
+			if entry.name == key and entry.amount > 0 then
+				fire("SpinService", "Use", id)
+				app.spinPending = {name = key, startedAt = os.clock()}
+				local ready = waitForChange(function() return isActive(key) end, 2)
+				if ready then app.spinPending = nil end
+				return ready, not ready
+			end
+		end
+	end
+	return false, false
+end
+task.spawn(function()
+	while app.alive do
+		local rolling = app.flags.AutoRoll or app.flags.Lucky or app.flags.Jackpot
+		if rolling and not app.travel.pausing and inventory() and app.modules.Units and app.modules.Buffs
+			and os.clock() >= app.rollNext and os.clock() >= app.fuseUntil then
+			local ok, err = pcall(function()
+				nativeRoll(true)
+				local inv = inventory()
+				if read("PendingTrade") then report("AutoRoll", "Waiting for your trade to finish."); return end
+				if (tonumber(read("AutoSell")) or 0) > 0 then
+					report("AutoRoll", "Waiting for the game's Auto Sell to turn off for protection."); return
+				end
+				local count, pending = unitCount(inv), pendingRollUnits(inv)
+				local capacity, rollCount = math.floor(buff("Unit Storage", 100)), math.floor(buff("Rolls", 1))
+				if count + pending >= capacity then
+					report("AutoRoll", pending > 0 and "Waiting for rolled units to reach inventory." or "Inventory full. Free space or enable Full Kaitun."); return
+				end
+				local activeSpin = false
+				for _, e in pairs(read("ActiveEntries") or {}) do if e.name == "Lucky Spin" or e.name == "Jackpot Spin" then activeSpin = true end end
+				if not app.flags.AutoRoll and not activeSpin
+					and not (app.flags.Lucky and tokenAmount(inv, "Lucky Spin") > 0)
+					and not (app.flags.Jackpot and tokenAmount(inv, "Jackpot Spin") > 0) then return end
+				local prepared, waiting = prepareSpin(inv)
+				if waiting then report("AutoRoll", "Waiting for spin activation."); app.rollNext = os.clock() + 0.3; return end
+				if not app.flags.AutoRoll and not prepared then return end
+				if prepared then rollCount = 1 end
+				-- Spin activation can yield; refresh storage and trade state before the roll.
+				inv = assert(inventory(), "Waiting for inventory.")
+				count, pending = unitCount(inv), pendingRollUnits(inv)
+				capacity = math.floor(buff("Unit Storage", 100))
+				if count + pending + rollCount > capacity then
+					report("AutoRoll", pending > 0 and "Waiting for rolled units to reach inventory." or "Inventory full. Free space or enable Full Kaitun."); return
+				end
+				if not app.alive or app.travel.pausing or read("PendingTrade")
+					or not (app.flags.AutoRoll or app.flags.Lucky or app.flags.Jackpot) then return end
+				local interval = math.max(0.05, buff("Roll Duration", 2.5))
+				local started = os.clock()
+				local results = invoke("RollService", "RollDice")
+				if not app.alive then return end
+				if type(results) == "table" and #results > 0 then
+					app.rollNext = started + interval + (app.flags.FastRoll and 0.05 or interval / 3 + 0.2)
+					app.rolls = app.rolls + 1
+					local names = {}
+					for _, result in ipairs(results) do table.insert(names, (result.mutation and result.mutation .. " " or "") .. tostring(result.result)) end
+					rollResult.Text = "Last roll: " .. table.concat(names, ", ")
+					if not app.flags.SkipAnimation then
+						rollDisplay.BackgroundColor3 = colors.primary
+						TweenService:Create(rollDisplay, TweenInfo.new(0.6), {BackgroundColor3 = colors.panel}):Play()
+					end
+					report("AutoRoll", "Rolling · " .. compact(interval) .. "s server cooldown · " .. app.rolls .. " rolls")
+				else
+					app.rollNext = os.clock() + math.min(0.5, math.max(0.15, interval))
+					report("AutoRoll", "Server is busy or cooling down. Retrying.")
+				end
+			end)
+			if not ok then app.rollNext = os.clock() + 2; report("AutoRoll", tostring(err):sub(1, 150), true) end
+		elseif not rolling and not app.travel.pausing and app.nativeRoll ~= nil then pcall(nativeRoll, false) end
+		if app.alive then
+			local inv = inventory() or {}
+			report("Lucky", "Owned: " .. tokenAmount(inv, "Lucky Spin") .. (app.flags.Lucky and " · using when ready" or ""))
+			report("Jackpot", "Owned: " .. tokenAmount(inv, "Jackpot Spin") .. (app.flags.Jackpot and " · using when ready" or ""))
+		end
+		task.wait(0.1)
+	end
+end)
+
+local actions = {}
+function actions.Rebirth()
+	local level, balance = read("Rebirth"), cash()
+	assert(type(level) == "number" and balance, "Waiting for money and rebirth data.")
+	local nextLevel = need("Rebirths").GetNext(level)
+	if not nextLevel then report("Rebirth", "Maximum rebirth reached."); return end
+	if balance < nextLevel.cost then report("Rebirth", compact(balance) .. " / " .. compact(nextLevel.cost) .. " cash"); return end
+	fire("RebirthService", "Rebirth")
+	local changed = waitForChange(function() return read("Rebirth") ~= level end, 2)
+	report("Rebirth", changed and "Rebirth complete." or "Request sent; waiting for confirmation.")
+end
+function actions.BuyDice()
+	local dice, owned = need("Dice"), read("OwnedDice")
+	assert(type(owned) == "table", "Waiting for owned dice.")
+	local _, ownedLuck = kaitunOwnedDice()
+	local nextDice, nextCfg, waitingDice, waitingCfg
+	for id, cfg in pairs(dice.GetAll()) do
+		if cfg.price and not owned[id] and cfg.luck > ownedLuck and (not app.flags.Kaitun or id == app.kaitun.cashChoice) then
+			if not waitingCfg or cfg.luck < waitingCfg.luck or cfg.luck == waitingCfg.luck and id < waitingDice then
+				waitingDice, waitingCfg = id, cfg
+			end
+			if readyToSpend(cfg.price, "BuyDice") and (not nextCfg or cfg.luck < nextCfg.luck or cfg.luck == nextCfg.luck and id < nextDice) then
+				nextDice, nextCfg = id, cfg
+			end
+		end
+	end
+	if not nextDice then
+		report("BuyDice", waitingDice and ("Next: " .. waitingDice .. " · " .. compact(waitingCfg.price) .. " cash") or "You own all higher luck dice."); return
+	end
+	fire("DiceShopService", "BuyDice", nextDice)
+	local changed = waitForChange(function() return (read("OwnedDice") or {})[nextDice] == true end, 2)
+	report("BuyDice", changed and "Bought " .. nextDice .. "." or "Waiting for purchase confirmation.")
+end
+function actions.EquipDice()
+	local dice, owned = need("Dice"), read("OwnedDice")
+	assert(type(owned) == "table", "Waiting for owned dice.")
+	local best, luck = dice.GetDefault(), 0
+	for id, cfg in pairs(dice.GetAll()) do
+		if (owned[id] or id == dice.GetDefault()) and cfg.luck > luck then best, luck = id, cfg.luck end
+	end
+	if read("Dice") ~= best then fire("DiceShopService", "EquipDice", best); task.wait(0.6) end
+	report("EquipDice", "Best owned dice: " .. best .. " · " .. compact(luck) .. " luck")
+end
+function actions.Place()
+	local inv, slots = inventory(), read("Slots")
+	assert(inv and type(slots) == "table", "Waiting for your inventory and slots.")
+	local units, indices = ranked(inv, "income"), unlockedSlots()
+	local wanted, current = {}, {}
+	for i = 1, math.min(#units, #indices) do wanted[units[i].id] = true end
+	for _, i in ipairs(indices) do
+		local slot = slots[tostring(i)] or slots[i]
+		if slot and slot.unitId then current[slot.unitId] = true end
+	end
+	local changed = false
+	for id in pairs(wanted) do if not current[id] then changed = true end end
+	for id in pairs(current) do if not wanted[id] then changed = true end end
+	if changed then fire("PlotService", "EquipBest"); task.wait(1.1) end
+	report("Place", "Using the best " .. math.min(#units, #indices) .. " income units on your plot.")
+end
+function actions.Team()
+	local units, team = ranked(inventory(), "damage"), read("TowerTeam")
+	assert(type(team) == "table", "Waiting for your tower team.")
+	local changed = false
+	for i = 1, 4 do if (team[i] or team[tostring(i)]) ~= (units[i] and units[i].id) then changed = true end end
+	if changed then fire("Towers", "EquipBestTowerTeam"); task.wait(1.1) end
+	report("Team", "Best damage team ready.")
+end
+function actions.Gear()
+	local inv, equipped = inventory(), read("EquippedGear")
+	assert(inv and type(equipped) == "table", "Waiting for gear inventory.")
+	local gear = need("GearConfig")
+	local selection = bestGear(inv, equipped)
+	for _, slot in ipairs(gear.slots) do
+		local name = selection[slot]
+		if name and name ~= equipped[slot] then
+			if not app.flags.Gear or read("PendingTrade") then return end
+			fire("GearService", "Equip", slot, name)
+			local changed = waitForChange(function() return (read("EquippedGear") or {})[slot] == name end, 1.5)
+			report("Gear", changed and "Equipped " .. name .. "." or "Waiting for gear confirmation.")
+			return -- One equip per pass respects the shared server debounce.
+		end
+	end
+	local names, keep = {}, math.max(1, math.floor(app.options.gearKeepCopies))
+	inv = assert(inventory(), "Waiting for gear inventory.")
+	equipped = read("EquippedGear") or {}
+	local protectedNames = {}
+	for _, name in pairs(equipped) do protectedNames[name] = true end
+	for _, name in pairs(selection) do if name then protectedNames[name] = true end end
+	for id, entry in pairs(inv) do
+		local cfg = gear.entries[entry.name]
+		if cfg and id == entry.name and entry.amount > keep and not protectedNames[id]
+			and not (entry.attributes or {}).locked and not cfg.limited and not cfg.protected then
+			for otherId, other in pairs(inv) do
+				local stronger = gear.entries[other.name]
+				if otherId == other.name and other.amount > 0 and stronger and gearDominates(stronger, cfg) then
+					table.insert(names, id); break
+				end
+			end
+		end
+	end
+	if #names == 0 then report("Gear", "Best gear equipped. No inferior duplicates to scrap."); return end
+	local network = RS:FindFirstChild("Network")
+	local service = network and network:FindFirstChild("GearService")
+	local rf = service and service:FindFirstChild("RF")
+	local salvage = rf and rf:FindFirstChild("SpixSalvageGear")
+	if not salvage or not salvage:IsA("RemoteFunction") then
+		report("Gear", "Best gear equipped. Install the salvage server script to scrap duplicates."); return
+	end
+	if not app.flags.Gear or read("PendingTrade") then return end
+	local reply = invoke("GearService", "SpixSalvageGear", names, keep)
+	if type(reply) == "table" and reply.ok then report("Gear", "Best gear equipped · scrapped " .. tostring(reply.removed) .. " duplicates.")
+	else report("Gear", type(reply) == "table" and tostring(reply.message) or "Waiting for salvage confirmation.", true) end
+end
+function actions.KaitunTrim()
+	if not app.flags.Kaitun or app.flags.SmartSell or app.flags.Overflow then return end
+	local inv = assert(inventory(), "Waiting for inventory.")
+	local count, pending, capacity = unitCount(inv), pendingRollUnits(inv), math.floor(buff("Unit Storage", 100))
+	if count + pending < math.max(1, capacity * 0.85) then return end
+	assert(app.props.EquippedUnitReady, "Waiting for your carried unit data.")
+	local protected, ids = protection(inv), {}
+	local target = math.max(1, math.floor(capacity * 0.7))
+	local units = unitNeeds(inv).trash
+	for _, unit in ipairs(units) do
+		local a = unit.entry.attributes or {}
+		if not protected[unit.id] and not unit.cfg.variant and not unit.cfg.limited
+			and not a.mutation and not a.trait and not a.grade and (a.level or 1) == 1 then
+			table.insert(ids, unit.id)
+			if count + pending - #ids <= target then break end
+		end
+	end
+	if #ids == 0 then
+		report("Kaitun", "Storage is nearly full of protected units. Income and upgrades continue."); return
+	end
+	if not app.flags.Kaitun or read("PendingTrade") then return end
+	local _, sold = invoke("SellService", "SellInventory", ids)
+	report("Kaitun", "Freed storage · sold " .. tostring(sold or 0) .. " low income spare units.")
+end
+function actions.Level()
+	local inv, slots = inventory(), read("Slots")
+	assert(inv and type(slots) == "table", "Waiting for your plot units.")
+	local best
+	for _, i in ipairs(unlockedSlots()) do
+		local slot = slots[tostring(i)] or slots[i]
+		local entry = slot and inv[slot.unitId]
+		local cfg = config(entry)
+		if cfg and (not app.flags.Kaitun or i == app.kaitun.cashChoice) then
+			local attributes = entry.attributes or {}
+			local nextAttributes = table.clone(attributes); nextAttributes.level = (attributes.level or 1) + 1
+			local current, nextIncome = score(cfg, "income", attributes), score(cfg, "income", nextAttributes)
+			local price = need("UnitUtil").GetLevelPrice(entry.name, attributes)
+			local gain = current and nextIncome and (nextIncome - current) * buff("Money Multiplier", 1)
+			if gain and gain > 0 and type(price) == "number" and readyToSpend(price, "Level") then
+				local payback = price / gain
+				if payback <= app.options.maxPayback and (not best or payback < best.payback) then
+					best = {slot = i, id = slot.unitId, level = attributes.level or 1, payback = payback}
+				end
+			end
+		end
+	end
+	if not best then report("Level", "Waiting for an affordable upgrade within your payback limit."); return end
+	fire("PlotService", "LevelUpSlot", best.slot)
+	local changed = waitForChange(function()
+		local entry = (inventory() or {})[best.id]
+		return entry and (entry.attributes.level or 1) > best.level
+	end, 2)
+	report("Level", changed and ("Upgraded slot " .. best.slot .. " · " .. compact(best.payback) .. "s payback") or "Waiting for level confirmation.")
+end
+function actions.Upgrades()
+	local owned, best = read("Upgrades"), nil
+	assert(type(owned) == "table", "Waiting for owned upgrades.")
+	local tree = need("Tree")
+	for id, cfg in pairs(need("Upgrades")) do
+		local parent = tree.GetParent(id)
+		if (not app.flags.Kaitun or id == app.kaitun.cashChoice) and id ~= "Start" and not owned[id] and (not parent or parent == "Start" or owned[parent])
+			and readyToSpend(cfg.price, "Upgrades") and (not best or cfg.price < best.price) then best = {id = id, price = cfg.price} end
+	end
+	if not best then report("Upgrades", "Waiting for cash or the next upgrade path."); return end
+	fire("", "BuyUpgrade", best.id)
+	local changed = waitForChange(function() return (read("Upgrades") or {})[best.id] == true end, 2)
+	report("Upgrades", changed and "Bought " .. best.id .. "." or "Waiting for upgrade confirmation.")
+end
+function actions.Sell()
+	local inv = assert(inventory(), "Waiting for inventory.")
+	if read("AutoSell") ~= 0 then fire("SellService", "UpdateAutoSell", 0); task.wait(0.2) end
+	assert(app.props.EquippedUnitReady, "Waiting for your carried unit data.")
+	inv = assert(inventory(), "Waiting for inventory.")
+	local protected = protection(inv)
+	local ids = {}
+	for _, unit in ipairs(ranked(inv, "income")) do
+		local size = unit.cfg.variant or "Normal"
+		local attributes = unit.entry.attributes or {}
+		local rarity = unit.cfg.getRarity and unit.cfg.getRarity(attributes) or unit.cfg.rarity
+		local unwanted = app.options.sellRarities[rarity] or app.options.sellMaxIncome > 0 and unit.value < app.options.sellMaxIncome
+		if unwanted and app.options.sellSizes[size] and not protected[unit.id] and not unit.cfg.limited then table.insert(ids, unit.id) end
+	end
+	if #ids == 0 then report("Sell", "No unprotected units match your filters."); return end
+	if not app.flags.Sell or read("PendingTrade") then return end
+	local _, sold = invoke("SellService", "SellInventory", ids)
+	report("Sell", "Sold " .. tostring(sold or 0) .. " units.")
+end
+function actions.Fuse()
+	if os.clock() < app.fuseUntil then return end
+	assert(app.props.EquippedUnitReady, "Waiting for your carried unit data.")
+	local inv = assert(inventory(), "Waiting for inventory.")
+	if app.flags.Kaitun or app.flags.SmartSell or app.flags.Overflow then
+		local plan = unitNeeds(inv).fusion
+		if not plan then report("Fuse", "No useful spare triple within the cash budget."); return end
+		if not readyToSpend(plan.price, "Fuse") then report("Fuse", "Saving cash for the next progression step."); return end
+		local protected = protection(inv, true)
+		for _, id in ipairs(plan.ids) do if protected[id] or not inv[id] or (inv[id].attributes or {}).locked then return end end
+		if not app.flags.Fuse or read("PendingTrade") or app.travel.pausing then return end
+		app.fuseUntil = os.clock() + 3.3
+		fire("FusingService", "Fuse", plan.ids[1], plan.ids[2], plan.ids[3])
+		waitForChange(function() return not (inventory() or {})[plan.ids[1]] end, 2)
+		report("Fuse", "Fusing spare units. Plot and combat units kept.")
+		return
+	end
+	local protected, groups = protection(inv), {}
+	for _, unit in ipairs(ranked(inv, "income")) do
+		local attributes = unit.entry.attributes or {}
+		if not protected[unit.id] and not unit.cfg.limited and not unit.cfg.variant
+			and not attributes.mutation and not attributes.grade and not attributes.trait
+			and (attributes.level or 1) == 1 and unit.value <= app.options.fuseMaxIncome and unit.entry.amount == 1 then
+			groups[unit.entry.name] = groups[unit.entry.name] or {}
+			table.insert(groups[unit.entry.name], unit)
+		end
+	end
+	local best
+	for _, group in pairs(groups) do
+		if #group >= 3 and (not best or group[1].value < best[1].value) then best = group end
+	end
+	if not best then report("Fuse", "Waiting for 3 matching spare Normal units."); return end
+	local chance = 0
+	for i = 1, 3 do chance = chance + assert(need("FuseUtil").GetChance(best[i].entry), "This unit cannot be fused.") end
+	local price = need("FuseConfig").GetCost(chance)
+	if not readyToSpend(price, "Fuse") then report("Fuse", "Fusion needs " .. compact(price) .. " cash."); return end
+	local pools = need("FuseUtil").BuildPools(chance)
+	if not pools then report("Fuse", "This triple has no valid fusion pool."); return end
+	if not app.flags.Fuse or read("PendingTrade") then return end
+	app.fuseUntil = os.clock() + 3.3
+	fire("FusingService", "Fuse", best[1].id, best[2].id, best[3].id)
+	waitForChange(function() return not (inventory() or {})[best[1].id] end, 2)
+	report("Fuse", "Fusion requested; waiting for the result.")
+end
+local function reroll(key)
+	if not app.flags[key] or read("PendingTrade") or app.travel.pausing or inventoryRequestPending() then return end
+	if not weatherAllows(key) then
+		report(key, "Waiting for " .. (key == "Traits" and "Trait Luck" or "Grade Luck") .. " weather."); return
+	end
+	local inv = assert(inventory(), "Waiting for inventory.")
+	local managed = app.flags.Kaitun == true
+	local plans = autoRerollPlans(inv)
+	if managed then app.kaitun.rerolls = plans end
+	if app.budget[key] >= math.floor(app.options.rerollLimit) then
+		report(key, "Reroll limit reached. Turn off/on to start again."); return
+	end
+	local token = key == "Traits" and "Trait Reroll" or "Gems"
+	local before = tokenAmount(inv, token)
+	if before - 1 < app.options.tokenReserve then report(key, "Waiting for " .. token .. ". Reserve: " .. app.options.tokenReserve); return end
+	local plan = plans[key]
+	if not plan then report(key, "Your best units are ready, or no rollable upgrade is available."); return end
+	local id, field = plan.id, key == "Traits" and "trait" or "grade"
+	local entry = inv[id]
+	if not unitMetadata(id, entry) or rerollReached(key, entry, plan) then return end
+	local current = entry.attributes[field]
+	if not app.flags[key] or read("PendingTrade") or app.travel.pausing or not weatherAllows(key) then return end
+	local weatherGated = app.flags.WeatherReroll == true
+	if managed and not weatherGated and optionalAutomation("WeatherReroll") then
+		local stat = key == "Traits" and "Trait Luck" or "Grade Luck"
+		weatherGated = weatherMultiplier(stat) >= app.options.weatherMinMultiplier and (currentWeather() or {remaining = 0}).remaining > 1
+	end
+	if weatherGated then
+		if not optionalAutomation("WeatherReroll") then report(key, "Install the automation server script for weather rerolls."); return end
+		local reply = invoke("SpixAutomation", "WeatherReroll", key, id, app.options.weatherMinMultiplier, true)
+		if type(reply) ~= "table" or not reply.ok then
+			report(key, type(reply) == "table" and tostring(reply.message) or "Waiting for weather reroll confirmation."); return
+		end
+	else
+		-- Automatic mode replaces intermediate results, including old protected presets.
+		fire(key == "Traits" and "TraitService" or "GradeService", "Roll", id, true)
+		app.rerollPending = app.rerollPending or {}
+		app.rerollPending[key] = {id = id, field = field, original = current, token = token, before = before,
+			startedAt = os.clock(), epoch = app.rerollEpoch and app.rerollEpoch[key] or 0}
+	end
+	local changed = waitForChange(function()
+		local now = inventory() or {}
+		if not weatherGated then settleNativeRerolls(now) end
+		return not now[id] or (now[id].attributes or {})[field] ~= current or tokenAmount(now, token) < before
+	end, 2)
+	local result = (inventory() or {})[id]
+	if result and rerollReached(key, result, plan) then app.rerollTargets[key] = nil end
+	report(key, tostring(entry.name) .. " → " .. plan.target .. " · " .. (changed and "Rerolled " or "Waiting · ")
+		.. app.budget[key] .. " / " .. math.floor(app.options.rerollLimit))
+end
+actions.Traits = function() reroll("Traits") end
+actions.Grades = function() reroll("Grades") end
+local actionOrder = {"Rebirth", "Place", "Team", "Gear", "EquipDice", "KaitunTrim", "BuyDice", "Level", "Upgrades", "Traits", "Grades", "Fuse", "Sell"}
+local cooldown = {Rebirth = 0.55, BuyDice = 0.65, EquipDice = 1.1, Place = 2, Team = 2,
+	Gear = 0.4, KaitunTrim = 1, Level = 0.2, Upgrades = 0.35, Traits = 0.3, Grades = 0.3, Fuse = 3.5, Sell = 1}
+task.spawn(function()
+	while app.alive do
+		if inventory() and app.modules.Units and not app.travel.pausing and not app.inventoryOwner and not inventoryRequestPending() then
+			if app.flags.Kaitun then
+				local ok, err = pcall(updateKaitun)
+				if not ok then report("Kaitun", tostring(err):sub(1, 150), true) end
+			end
+			app.inventoryBusy = true
+			local ok, err = pcall(syncLocks, inventory())
+			app.inventoryBusy = false
+			if not ok then report("KeepBest", tostring(err):sub(1, 150), true) end
+			for _, key in ipairs(actionOrder) do
+				if not app.alive or app.travel.pausing or app.inventoryOwner or inventoryRequestPending() then break end
+				if app.flags.Kaitun and app.kaitun.cashAction == key and os.clock() >= (app.retry[key] or 0)
+					and (key == "BuyDice" or key == "Level" or key == "Upgrades" or key == "Fuse") then
+					local ok, err = pcall(updateKaitun)
+					if not ok then app.kaitun.ready = false; report("Kaitun", tostring(err):sub(1, 150), true) end
+				end
+				if (app.flags[key] or key == "KaitunTrim" and app.flags.Kaitun) and kaitunActionReady(key) and os.clock() >= (app.retry[key] or 0) then
+					if read("PendingTrade") then report(key == "KaitunTrim" and "Kaitun" or key, "Paused while your trade is active.")
+					else
+						app.inventoryBusy = true
+						local success, result = pcall(actions[key])
+						app.inventoryBusy = false
+						app.retry[key] = os.clock() + actionRetryDelay(key, success, cooldown[key])
+						if not success then report(key == "KaitunTrim" and "Kaitun" or key, tostring(result):sub(1, 150), true) end
+					end
+				end
+			end
+		end
+		task.wait(0.15)
+	end
+end)
+
+local function sequenceDuration(sequence)
+	local refs, seconds = need("TowerRefs"), 0
+	for i, action in ipairs(sequence) do
+		if action.action == refs.Actions.floorStarted then
+			if i == 1 then seconds = seconds + (action.floor == 1 and refs.FloorStartedWaitTime.initial or refs.FloorStartedWaitTime.transition)
+			else seconds = seconds + (sequence[i - 1].action == refs.Actions.memberDefeated and refs.FloorStartedWaitTime.transition or refs.FloorStartedWaitTime.repeated) end
+		else seconds = seconds + (refs.ActionWaitTime[action.action] or 0) end
+	end
+	return seconds
+end
+app.sequenceDuration = sequenceDuration
+task.spawn(function()
+	while app.alive do
+		if (app.flags.Tower or app.tower.stopping) and inventory() and os.clock() >= app.tower.nextAt then
+			local ok, err = pcall(function()
+				local tower = app.tower
+				if tower.stopping and tower.owned then
+					invoke("Towers", "CancelTower")
+					local sequence = invoke("Towers", "CompleteTowerFloor")
+					if type(sequence) == "table" then tower.owned, tower.stopping = false, false end
+					return
+				end
+				if not app.flags.Tower then return end
+				if app.travel.pausing and not tower.owned then tower.nextAt = os.clock() + 1; return end
+				local id = app.options.towerId
+				if not id and app.flags.Kaitun then
+					tower.nextAt = os.clock() + 2
+					report("Tower", "Building a team that can clear a tower floor."); return
+				end
+				assert(id and need("Towers").Get(id), "Select a tower first.")
+				if not tower.owned then
+					if app.nativeTower == nil then app.nativeTower = read("AutoTower") or "" end
+					if read("AutoTower") ~= "" then fire("Towers", "SetAutoTower", false) end
+					if read("PendingTrade") then report("Tower", "Waiting for your trade."); return end
+					fire("Towers", "EquipBestTowerTeam")
+					task.wait(1.1)
+					if not app.alive or not app.flags.Tower or app.travel.pausing or read("PendingTrade") then return end
+					tower.startAt = os.clock()
+					tower.owned = invoke("Towers", "PlayTower", id) == true
+					tower.id = id
+					if not tower.owned then tower.nextAt = os.clock() + 3.2; report("Tower", "Waiting for a team or an existing tower run."); return end
+					if not app.alive or not app.flags.Tower then tower.stopping = true; return end
+				end
+				local sequence = invoke("Towers", "CompleteTowerFloor")
+				if type(sequence) ~= "table" or #sequence == 0 then tower.nextAt = os.clock() + 1; return end
+				tower.nextAt = os.clock() + sequenceDuration(sequence) + 0.1
+				for _, action in ipairs(sequence) do
+					if action.floor then tower.floor = action.floor end
+					if action.action == "ended" then tower.owned = false; tower.nextAt = math.max(tower.nextAt, tower.startAt + 3.2) end
+				end
+				report("Tower", "Farming " .. tostring(tower.id) .. " · floor " .. tower.floor)
+			end)
+			if not ok then app.tower.nextAt = os.clock() + 3; report("Tower", tostring(err):sub(1, 150), true) end
+		elseif not app.flags.Tower and not app.tower.owned and app.nativeTower ~= nil
+			and not app.requests["Towers/PlayTower"] and not app.requests["Towers/CompleteTowerFloor"] then
+			pcall(fire, "Towers", "SetAutoTower", app.nativeTower ~= "" and app.nativeTower or false); app.nativeTower = nil
+		end
+		task.wait(0.15)
+	end
+end)
+local function claimReadyRewards()
+	if not app.flags.Quests or not app.alive or app.travel.pausing or read("PendingTrade") then return end
+	local periods, count = need("Quests").Periods, 0
+	for period, cfg in pairs(periods) do
+		for _, quest in ipairs(cfg.quests) do
+			if not app.flags.Quests or not app.alive or app.travel.pausing or read("PendingTrade") then return end
+			local state = (read("Quests") or {})[period]
+			if state and type(state.expiresAt) == "number" and os.time() < state.expiresAt
+				and not (state.claimed or {})[quest.id] and ((state.progress or {})[quest.id] or 0) >= quest.target then
+				fire("QuestService", "Claim", period, quest.id, state.expiresAt)
+				count = count + 1; task.wait(0.23)
+			end
+		end
+	end
+	if not app.flags.Quests or not app.alive or app.travel.pausing or read("PendingTrade") then return end
+	local last, daily = read("LastDailyRewardClaim"), app.modules.Daily
+	if daily and type(last) == "number" and (last == 0 or os.time() - last >= daily.Cooldown) then
+		fire("DailyRewardService", "Claim"); count = count + 1
+	end
+	report("Quests", count > 0 and "Requested " .. count .. " ready rewards." or "Watching for completed quests.")
+end
+task.spawn(function()
+	while app.alive do
+		if app.flags.Quests and inventory() then
+			local ok, err = pcall(claimReadyRewards)
+			if not ok then report("Quests", tostring(err):sub(1, 150), true) end
+		end
+		task.wait(0.5)
+	end
+end)
+
+-- Modules use the live game's code so multipliers and prices remain authoritative.
+local modulePaths = {
+	Data = "Data/DataController", Buffs = "Buffs/BuffController", Units = "Inventory/Kinds/Unit/UnitConfig",
+	UnitUtil = "Inventory/Kinds/Unit/UnitUtil", Dice = "Rolling/Dice", Plot = "Plot/PlotConfig",
+	Rebirths = "Rebirth/Rebirths", Traits = "Traits/Traits", Grades = "Grades/Grades",
+	Upgrades = "Upgrades/Upgrades", Tree = "Upgrades/TreeStructure", Quests = "Quests/QuestConfig",
+	Towers = "Towers/Towers", TowerRefs = "Towers/TowerRefs", FuseConfig = "Fusing/FusingConfig",
+	FuseUtil = "Fusing/FusingUtil", Daily = "Rewards/DailyRewardConfig",
+	GearConfig = "Inventory/Kinds/Gear/GearConfig", BuffsConfig = "Buffs/BuffsConfig",
+	WeatherConfig = "Weather/WeatherConfig",
+}
+local function loadModule(name, path)
+	local attempt = 0
+	while app.alive and not app.modules[name] do
+		local ok, result = pcall(function()
+			local node = RS:WaitForChild("Framework", 10)
+			node = assert(node, "Framework missing"):WaitForChild("Features", 10)
+			for segment in path:gmatch("[^/]+") do node = assert(node, "Feature path missing"):WaitForChild(segment, 5) end
+			local loaded = require(assert(node, "Module missing"))
+			assert(type(loaded) == "table", "Module did not return game data")
+			return loaded
+		end)
+		if not app.alive then return end
+		if ok then
+			app.modules[name] = result
+			app.moduleErrors[name] = nil
+			if name == "Data" then
+				pcall(function()
+					local dispose = result.Inventory.OnKeyAdded(recordUnitArrival)
+					if type(dispose) == "function" then table.insert(app.disposers, dispose) end
+				end)
+			end
+			return
+		end
+		app.moduleErrors[name] = tostring(result):sub(1, 110)
+		attempt = math.min(5, attempt + 1)
+		task.wait(math.min(30, 2 ^ attempt))
+	end
+end
+for name, path in pairs(modulePaths) do
+	task.spawn(function() loadModule(name, path) end)
+end
+local function watchNetworkEvent(namespace, kind, name, handler, property)
+	local current, connection, askedAt = nil, nil, -math.huge
+	while app.alive do
+		local network = RS:FindFirstChild("Network")
+		local service = network and network:FindFirstChild(namespace)
+		local group = service and service:FindFirstChild(kind)
+		local event = group and group:FindFirstChild(name)
+		if event ~= current then
+			if connection then connection:Disconnect(); connection = nil end
+			current, askedAt = event, -math.huge
+			if property then app.props[name .. "Ready"] = false end
+			if event and event:IsA("RemoteEvent") then
+				connection = connect(event.OnClientEvent, function(...) if app.alive then handler(...) end end)
+			end
+		end
+		if property and connection and not app.props[name .. "Ready"] and os.clock() - askedAt >= 3 then
+			askedAt = os.clock(); pcall(current.FireServer, current)
+		end
+		task.wait(0.5)
+	end
+	if connection then connection:Disconnect() end
+end
+for _, spec in ipairs({{"PlotService", "PlotId"}, {"UnitService", "EquippedUnit"}, {"WeatherService", "ActiveWeather"}}) do
+	local namespace, name = spec[1], spec[2]
+	task.spawn(function()
+		pcall(function()
+			watchNetworkEvent(namespace, "RP", name, function(value) app.props[name] = value; app.props[name .. "Ready"] = true end, true)
+		end)
+	end)
+end
+task.spawn(function()
+	watchNetworkEvent("FusingService", "RE", "Result", function(result, err)
+		report("Fuse", result and "Fused: " .. tostring(result.name) or tostring(err or "Waiting for a fusion result."), not result)
+	end, false)
+end)
+connect(player.Idled, function()
+	if not app.flags.AntiAFK then return end
+	local ok = pcall(function()
+		local user = game:GetService("VirtualUser")
+		user:CaptureController()
+		user:ClickButton2(Vector2.new())
+	end)
+	report("AntiAFK", ok and "Idle input sent." or "Client input is unavailable. The game's AFK rejoin is still active.", not ok)
+end)
+task.spawn(function()
+	while app.alive do
+		if app.flags.SkipAnimation then
+			local root = playerGui:FindFirstChild("Root")
+			local rolling = root and root:FindFirstChild("Rolling")
+			if rolling and rolling:IsA("GuiObject") then
+				if not app.hiddenRoll or app.hiddenRoll.object ~= rolling then
+					if app.hiddenRoll and app.hiddenRoll.object.Parent then app.hiddenRoll.object.Visible = app.hiddenRoll.visible end
+					app.hiddenRoll = {object = rolling, visible = rolling.Visible}
+				end
+				rolling.Visible = false
+			end
+			report("SkipAnimation", "Roll visuals hidden. Server rewards keep their normal timing.")
+		elseif app.hiddenRoll then
+			if app.hiddenRoll.object.Parent then app.hiddenRoll.object.Visible = app.hiddenRoll.visible end
+			app.hiddenRoll = nil
+		end
+		report("FastRoll", app.flags.FastRoll and "Minimum interval: " .. compact(buff("Roll Duration", 2.5)) .. "s" or "Standard interval")
+		report("KeepMutations", (app.flags.SmartSell or app.flags.Overflow) and "Smart Sell ranks mutations by their actual stats."
+			or (app.flags.KeepMutations or app.flags.RareProtection) and "Mutations are kept from filtered sales and fusion." or "Mutation protection is off.")
+		local weather = currentWeather()
+		weatherLabel.Text = not app.props.ActiveWeatherReady and "Waiting for weather data..."
+			or weather and (weather.name .. " · " .. math.ceil(weather.remaining) .. "s left\nRoll " .. compact(weatherMultiplier("Luck"))
+				.. "x · Trait " .. compact(weatherMultiplier("Trait Luck")) .. "x · Grade " .. compact(weatherMultiplier("Grade Luck")) .. "x") or "Clear weather"
+		if app.flags.WeatherReroll then
+			report("WeatherReroll", (app.flags.Traits or app.flags.Grades)
+				and "Matching weather gates enabled Trait/Grade rerolls."
+				or "Enable Auto Reroll Traits or Grades. Units and targets are picked automatically.")
+		end
+		local data = inventory()
+		footer.Text = data and ("Cash " .. compact(cash()) .. "  ·  " .. unitCount(data) .. " units  ·  " .. (app.props.PlotId and "Own plot connected" or "Own account data"))
+			or (app.moduleErrors.Data and "Game data unavailable: " .. app.moduleErrors.Data or "Waiting for the game's data controller...")
+		task.wait(0.5)
+	end
+end)
+
+do
+	local splash = make("CanvasGroup", {Parent = window, Size = UDim2.fromScale(1, 1),
+		BackgroundColor3 = colors.bg, BorderSizePixel = 0, Active = true, ZIndex = 50})
+	local box = make("Frame", {Parent = splash, AnchorPoint = Vector2.new(0.5, 0.5),
+		Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, -32, 0, 146),
+		BackgroundColor3 = colors.panel, BorderSizePixel = 0, ZIndex = 51})
+	make("UISizeConstraint", {Parent = box, MaxSize = Vector2.new(330, 146)})
+	round(box); stroke(box)
+	local heading = label(box, "Spix Hub | Dice & Units", UDim2.new(1, -28, 0, 34), UDim2.fromOffset(14, 12), 14, colors.text, true); heading.ZIndex = 52
+	local caption = label(box, "Loading...", UDim2.new(1, -28, 0, 34), UDim2.fromOffset(14, 65), 12, colors.green); caption.ZIndex = 52
+	local track = make("Frame", {Parent = box, Position = UDim2.new(0, 14, 1, -26),
+		Size = UDim2.new(1, -28, 0, 5), BackgroundColor3 = colors.surface, BorderSizePixel = 0, ZIndex = 52}); round(track, 4)
+	local fill = make("Frame", {Parent = track, Size = UDim2.fromScale(0, 1), BackgroundColor3 = colors.primary, BorderSizePixel = 0, ZIndex = 53}); round(fill, 4)
+	task.spawn(function()
+		local started = os.clock()
+		local t = TweenService:Create(fill, TweenInfo.new(2), {Size = UDim2.fromScale(0.85, 1)}); t:Play()
+		while app.alive and (os.clock() - started < 1.2 or not inventory() and os.clock() - started < 5) do
+			caption.Text = "Loading" .. string.rep(".", math.floor((os.clock() - started) * 3) % 4); task.wait(0.17)
+		end
+		if not app.alive then return end
+		t:Cancel(); caption.Text = inventory() and "Ready" or "Opening hub..."
+		TweenService:Create(fill, TweenInfo.new(0.2), {Size = UDim2.fromScale(1, 1)}):Play(); task.wait(0.22)
+		if not app.alive then return end
+		TweenService:Create(splash, TweenInfo.new(0.3), {GroupTransparency = 1}):Play(); task.wait(0.31)
+		if splash.Parent then splash:Destroy() end
+	end)
+end
+app.cleanupTower = function()
+	if app.tower.cleanupRunning then return end
+	app.tower.cleanupRunning = true
+	task.spawn(function()
+		pcall(function()
+			local limit = os.clock() + 10
+			while (app.requests["Towers/PlayTower"] or app.requests["Towers/CompleteTowerFloor"]) and os.clock() < limit do task.wait(0.1) end
+			-- A late response calls this function again after removing the pending request.
+			if app.requests["Towers/PlayTower"] or app.requests["Towers/CompleteTowerFloor"] then return end
+			if app.tower.owned then
+				remote("Towers", "RF", "CancelTower"):InvokeServer()
+				local deadline = math.max(os.clock(), app.tower.nextAt)
+				while os.clock() < deadline do task.wait(math.min(0.5, deadline - os.clock())) end
+				local sequence = remote("Towers", "RF", "CompleteTowerFloor"):InvokeServer()
+				if type(sequence) == "table" then
+					for _, action in ipairs(sequence) do if action.action == "ended" then app.tower.owned = false end end
+				end
+			end
+			if not app.tower.owned and app.nativeTower ~= nil then
+				fire("Towers", "SetAutoTower", app.nativeTower ~= "" and app.nativeTower or false)
+				app.nativeTower = nil
+			end
+		end)
+		app.tower.cleanupRunning = false
+	end)
+end
+local function cleanup()
+	if not app.alive then return end
+	app.alive = false
+	app.cleanupTower()
+	if app.nativeRoll ~= nil then pcall(fire, "RollService", "SetAutoRoll", app.nativeRoll) end
+	if app.nativeSell ~= nil then pcall(fire, "SellService", "UpdateAutoSell", app.nativeSell) end
+	local unlock = {}
+	for id in pairs(app.ownedLocks) do if (inventory() or {})[id] then unlock[id] = false end end
+	if next(unlock) then pcall(fire, "UnitService", "SetLocked", unlock) end
+	if app.hiddenRoll and app.hiddenRoll.object.Parent then app.hiddenRoll.object.Visible = app.hiddenRoll.visible end
+	for _, connection in ipairs(app.connections) do connection:Disconnect() end
+	for _, connection in ipairs(app.popupConnections) do connection:Disconnect() end
+	for _, dispose in ipairs(app.disposers) do pcall(dispose) end
+	if gui.Parent then gui:Destroy() end
+end
+local shutdown = make("BindableEvent", {Parent = gui, Name = "Shutdown"})
+connect(shutdown.Event, cleanup)
+connect(gui.Destroying, cleanup)
+connect(unload.Activated, cleanup)
