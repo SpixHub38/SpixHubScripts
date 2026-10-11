@@ -1,0 +1,30 @@
+local PlaceId = game.PlaceId
+local GameName = game:GetService("MarketplaceService"):GetProductInfo(PlaceId).Name
+
+print("Loading Hub for: " .. GameName)
+
+-- [[ CONFIGURATION ]] --
+-- Add your games here. Format: [PlaceID] = "Script Link or Code"
+local SupportedGames = {
+    [113290951185459] = "https://raw.githubusercontent.com/SpixHub38/SpixHubScripts/refs/heads/main/Anime%20Dice",
+    [96425088123775]  = "https://raw.githubusercontent.com/SpixHub38/SpixHubScripts/refs/heads/main/My%20Toll%20Farm",
+    [142823291]  = "https://githubusercontent.com",
+}
+
+local function LoadScript(url)
+    local success, err = pcall(function()
+        loadstring(game:HttpGet(url))()
+    end)
+    
+    if success then
+        print("Successfully loaded script for " .. GameName)
+    else
+        warn("Failed to load script: " .. err)
+    end
+end
+
+if SupportedGames[PlaceId] then
+    LoadScript(SupportedGames[PlaceId])
+else
+    print("Game not supported specifically.")
+end
