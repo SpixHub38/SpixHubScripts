@@ -1,0 +1,1545 @@
+local Core = {}
+function Core.number(value)
+    local n = tonumber(value)
+    if n and n == n and math.abs(n) < math.huge then return n end
+end
+function Core.affordable(cash, price, reserve)
+    cash, price = Core.number(cash), Core.number(price)
+    return cash ~= nil and price ~= nil and price >= 0 and cash - math.max(Core.number(reserve) or 0, 0) >= price
+end
+function Core.accepted(value, detail)
+    if value == true then return true, detail end
+    if type(value) == 'table' then return value.ok == true, value.err or value.message end
+    return false, type(detail) == 'string' and detail or 'The game did not accept the action'
+end
+function Core.best(pets, capacity)
+    local valid, seen = {}, {}
+    for _, pet in ipairs(pets) do
+        if type(pet.uid) == 'string' and pet.uid ~= '' and not seen[pet.uid] then
+            seen[pet.uid] = true
+            local rate = Core.number(pet.rate)
+            if rate == nil then return nil, 'Waiting for pet income data' end
+            valid[#valid + 1] = {uid = pet.uid, rate = rate, placed = pet.placed == true}
+        end
+    end
+    table.sort(valid, function(a, b)
+        if a.rate ~= b.rate then return a.rate > b.rate end
+        if a.placed ~= b.placed then return a.placed end
+        return a.uid < b.uid
+    end)
+    local keep = {}
+    for i = 1, math.min(#valid, math.max(math.floor(capacity or 0), 1)) do keep[valid[i].uid] = true end
+    return keep, valid
+end
+function Core.sellable(rows, keep, known, locked)
+    if not keep then return {} end
+    local ids, seen = {}, {}
+    for _, row in ipairs(rows) do
+        if type(row) == 'table' and row.kind == 'Pet' and type(row.uid) == 'string' and row.uid ~= ''
+            and known[row.uid] and not keep[row.uid] and not locked[row.uid] and not seen[row.uid] then
+            seen[row.uid] = true
+            ids[#ids + 1] = row.uid
+            if #ids == 200 then break end
+        end
+    end
+    return ids
+end
+function Core.rift(state, now)
+    if state.disabled then return false, 'Rift is disabled' end
+    if state.downed then return false, 'Waiting for the arena to revive you' end
+    if state.fighting then return false, 'Already in the arena' end
+    if not state.gate then return false, 'Waiting for the portal to spawn' end
+    if state.state ~= 'open' and state.state ~= 'live' then return false, 'Waiting for the rift to open' end
+    if state.state == 'live' and not state.late then return false, 'Late entry is closed' end
+    if state.untilAt and now >= state.untilAt then return false, 'Portal entry has closed' end
+    if state.full then return false, 'Rift is full' end
+    return true
+end
+function Core.clamp(value, minimum, maximum)
+    local n = Core.number(value)
+    if not n then return minimum end
+    return math.max(minimum, math.min(maximum, n))
+end
+function Core.selection(value)
+    if type(value) == 'table' then value = value.Title or value[1] end
+    return type(value) == 'string' and value or nil
+end
+if rawget(_G, '__SPIX_EGG_TEST_MODE') == 'core' then return Core end
+
+local Players = game:GetService('Players')
+local RS = game:GetService('ReplicatedStorage')
+local RunService = game:GetService('RunService')
+local UIS = game:GetService('UserInputService')
+local Pathfinding = game:GetService('PathfindingService')
+local PPS = game:GetService('ProximityPromptService')
+local HttpService = game:GetService('HttpService')
+local player = Players.LocalPlayer
+if not player then error('Spix Hub must run on the client') end
+local environment = type(getgenv) == 'function' and getgenv() or _G
+local previous = environment.SpixAnimalEgg
+local previousRarity = previous and previous.config and Core.selection(previous.config.EggRarity)
+if previous and type(previous.destroy) == 'function' then pcall(previous.destroy, previous) end
+local hub = {
+    alive = true, connections = {}, workers = {}, modules = {}, pending = {}, statuses = {}, errors = {},
+    promptDefaults = setmetatable({}, {__mode = 'k'}), collisionDefaults = setmetatable({}, {__mode = 'k'}),
+    promptCooldown = setmetatable({}, {__mode = 'k'}), foodCooldown = {}, attacks = {},
+    stealStats = {native = 0, direct = 0, confirmed = 0, timeouts = 0}, claimCounter = 0,
+    motionFailures = {}, eggPromptWatches = setmetatable({}, {__mode = 'k'}), stealScan = {}, stealRevision = 0,
+    config = {
+        AutoSteal = false, AutoHatch = false, AutoPlace = false, AutoEquip = false,
+        AutoCook = false, AutoEat = false, AutoSell = false, AutoPortal = false,
+        AutoBoss = false, InfiniteRespawn = false, UpgradeTable = false, UpgradePen = false,
+        AutoSit = false, AutoTraits = false, InstantPrompt = false,
+        SpeedEnabled = false, JumpEnabled = false, WalkSpeed = 24, JumpPower = 60,
+        NoClip = false, Fly = false, InfiniteJump = false, FlySpeed = 60,
+        Travel = 'Tween', TravelSpeed = 300, EggRarity = previousRarity or 'All rarities', CashReserve = 0,
+    },
+    build = 'egg-8', version = '1.0.0', core = Core,
+}
+environment.SpixAnimalEgg = hub
+local clock = os.clock
+local function connect(signal, callback)
+    local connection = signal:Connect(callback)
+    hub.connections[#hub.connections + 1] = connection
+    return connection
+end
+local function status(key, text)
+    hub.statuses[key] = tostring(text)
+end
+local function attr(object, name, default)
+    if not object then return default end
+    local value = object:GetAttribute(name)
+    if value == nil then return default end
+    return value
+end
+local function children(object)
+    return object and object:GetChildren() or {}
+end
+local function holders()
+    local result = {}
+    if player.Character then result[#result + 1] = player.Character end
+    local backpack = player:FindFirstChild('Backpack')
+    if backpack then result[#result + 1] = backpack end
+    return result
+end
+local function find(parent, ...)
+    for _, name in ipairs({...}) do
+        if not parent then return nil end
+        parent = parent:FindFirstChild(name)
+    end
+    return parent
+end
+local function part(object)
+    if not object then return nil end
+    if object:IsA('BasePart') then return object end
+    local primary = object:IsA('Model') and object.PrimaryPart or nil
+    return primary or object:FindFirstChild('Root') or object:FindFirstChildWhichIsA('BasePart', true)
+end
+local function body()
+    local character = player.Character
+    local humanoid = character and character:FindFirstChildOfClass('Humanoid')
+    local root = character and character:FindFirstChild('HumanoidRootPart')
+    if not humanoid or not root or humanoid.Health <= 0 then return character end
+    return character, humanoid, root
+end
+local function myPlot()
+    for _, plot in ipairs(workspace:GetChildren()) do
+        if plot:IsA('Model') and plot.Name:match('^Base %d+$') and attr(plot, 'OwnerUserId') == player.UserId then return plot end
+    end
+end
+local function money()
+    local value = find(player, 'leaderstats', 'Money')
+    return value and Core.number(value.Value)
+end
+local function ready(key)
+    local _, humanoid = body()
+    if not humanoid then status(key, 'Waiting for your character'); return false end
+    if attr(player, 'SaveLoaded') == false or attr(player, 'DataLoaded') == false or attr(player, 'SaveStatus') == 'failed' then
+        status(key, 'Waiting for your save data'); return false
+    end
+    if attr(player.Character, 'GlitchDowned') == true then status(key, 'Waiting for revival'); return false end
+    return true
+end
+local function moduleAt(...)
+    local instance = find(RS, ...)
+    if not instance or not instance:IsA('ModuleScript') then return nil end
+    local record = hub.modules[instance]
+    if not record then
+        record = {loading = true}; hub.modules[instance] = record
+        task.spawn(function()
+            local ok, value = pcall(require, instance)
+            if ok and type(value) == 'table' then record.value = value end
+            record.loading = false; record.retry = clock() + 5
+        end)
+    elseif not record.loading and not record.value and clock() >= record.retry then
+        hub.modules[instance] = nil
+    end
+    return record.value
+end
+local function remote(folder, name, kind)
+    local value = find(RS, folder, name)
+    if value and value:IsA(kind) then return value end
+end
+local function restoreCollisions()
+    for object, value in pairs(hub.collisionDefaults) do
+        if object.Parent then pcall(function() object.CanCollide = value end) end
+        hub.collisionDefaults[object] = nil
+    end
+end
+local function cancelMotion(owner)
+    local motion = hub.motion
+    if motion and (not owner or motion.owner == owner) then
+        hub.motion = nil
+        local _, humanoid, root = body()
+        if humanoid and root then pcall(function() humanoid:MoveTo(root.Position); humanoid:Move(Vector3.zero) end) end
+    end
+end
+local function stopFly()
+    local fly = hub.flight
+    if not fly then return end
+    hub.flight = nil
+    for _, object in ipairs(fly.objects) do pcall(function() object:Destroy() end) end
+    if fly.humanoid.Parent then
+        fly.humanoid.PlatformStand = fly.platform
+        fly.humanoid.AutoRotate = fly.rotate
+    end
+end
+local function restorePrompts()
+    for prompt, value in pairs(hub.promptDefaults) do
+        if prompt.Parent then pcall(function() prompt.HoldDuration = value end) end
+        hub.promptDefaults[prompt] = nil
+    end
+end
+local function releaseHold()
+    local hold = hub.hold
+    if not hold then return end
+    hub.hold = nil
+    if hold.connection then pcall(function() hold.connection:Disconnect() end) end
+    for _, connection in ipairs(hold.watches or {}) do pcall(function() connection:Disconnect() end) end
+    if hold.thread and type(task.cancel) == 'function' then pcall(task.cancel, hold.thread) end
+    pcall(function()
+        hold.prompt:InputHoldEnd()
+        if hub.config.InstantPrompt then hold.prompt.HoldDuration = 0
+        else hold.prompt.HoldDuration = hold.previousDuration end
+    end)
+end
+local function instantPrompt(prompt)
+    if hub.config.InstantPrompt and prompt:IsA('ProximityPrompt') then
+        if hub.promptDefaults[prompt] == nil then hub.promptDefaults[prompt] = prompt.HoldDuration end
+        if hub.hold and hub.hold.prompt == prompt then return end
+        prompt.HoldDuration = 0
+    end
+end
+function hub:set(key, value)
+    if self.config[key] == nil then return end
+    if key == 'EggRarity' and self.config[key] == value then return end
+    self.config[key] = value
+    local worker = self.workers[key]
+    if worker then worker.next = 0 end
+    if value == false then cancelMotion(key); status(key, 'Off') end
+    if key == 'Fly' and not value then stopFly() end
+    if key == 'Fly' and value then releaseHold(); cancelMotion() end
+    if key == 'AutoSteal' and not value then
+        releaseHold(); hub.stealTarget = nil; self.motionFailures.AutoSteal = nil; self.stealRevision = self.stealRevision + 1
+    end
+    if key == 'EggRarity' then
+        releaseHold(); cancelMotion('AutoSteal'); self.stealTarget = nil
+        self.motionFailures.AutoSteal = nil
+        self.stealRevision = self.stealRevision + 1
+        if self.workers.AutoSteal then self.workers.AutoSteal.next = 0 end
+        local control = self.controls and self.controls.EggRarity
+        if control and type(control.Select) == 'function' then pcall(control.Select, control, value) end
+    end
+    if key == 'NoClip' and not value then restoreCollisions() end
+    if key == 'InstantPrompt' then
+        if value then for _, object in ipairs(workspace:GetDescendants()) do instantPrompt(object) end
+        else restorePrompts() end
+    end
+    if key == 'Travel' then cancelMotion() end
+end
+function hub:destroy()
+    if not self.alive then return end
+    self.alive = false
+    if self.streamThread and type(task.cancel) == 'function' then pcall(task.cancel, self.streamThread) end
+    cancelMotion(); stopFly(); releaseHold(); restoreCollisions(); restorePrompts()
+    if self.movementDefaults and self.movementDefaults.humanoid.Parent then
+        local old = self.movementDefaults
+        old.humanoid.WalkSpeed = old.speed; old.humanoid.JumpPower = old.jump; old.humanoid.JumpHeight = old.height
+    end
+    for _, connection in ipairs(self.connections) do pcall(function() connection:Disconnect() end) end
+    if self.window then pcall(function() self.window:Destroy() end) end
+    if self.touchGui then self.touchGui:Destroy() end
+    if environment.SpixAnimalEgg == self then environment.SpixAnimalEgg = nil end
+end
+local function pausedForEvent(key)
+    if key == 'AutoPortal' or key == 'AutoBoss' or key == 'InfiniteRespawn' then return false end
+    if attr(player, 'BossLoopFight') ~= nil then status(key, 'Paused while you are in the rift'); return true end
+    return false
+end
+local function requestStream(position)
+    if not workspace.StreamingEnabled or type(player.RequestStreamAroundAsync) ~= 'function'
+        or hub.streamBusy or clock() - (hub.lastStreamAt or -10) < 3 then return end
+    hub.lastStreamAt = clock(); hub.streamBusy = true
+    hub.streamThread = task.spawn(function()
+        local ok, reason = pcall(player.RequestStreamAroundAsync, player, position, 2)
+        hub.streamBusy = false
+        if not ok then hub.errors.Streaming = tostring(reason) end
+    end)
+end
+local function routeLeg(character, humanoid, root, destination)
+    local delta = destination - root.Position
+    if delta.Magnitude <= 400 then return destination end
+    local desired = root.Position + delta.Unit * 250
+    local params = RaycastParams.new(); params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {character}; params.RespectCanCollide = true; params.IgnoreWater = true
+    local hit = workspace:Raycast(desired + Vector3.new(0, 40, 0), Vector3.new(0, -120, 0), params)
+    if hit and hit.Normal.Y >= 0.6 then
+        return hit.Position + Vector3.new(0, humanoid.HipHeight + root.Size.Y / 2, 0)
+    end
+    requestStream(desired)
+end
+local function travel(key, destination, reach, priority, teleport)
+    local _, humanoid, root = body()
+    if not root or not destination then status(key, 'Waiting for a loaded destination'); return false end
+    if hub.config.Fly then status(key, 'Pause Fly to let automation travel'); return false end
+    if hub.hold and key ~= 'AutoSteal' then status(key, 'Waiting for the egg interaction'); return false end
+    local current = hub.motion
+    if current and current.owner ~= key and current.priority >= priority and clock() - current.touched < 2 then
+        status(key, 'Waiting for the current trip'); return false
+    end
+    local gap = (root.Position - destination).Magnitude
+    if gap <= reach then
+        if current and current.owner ~= key then cancelMotion() else cancelMotion(key) end
+        return true
+    end
+    if teleport or hub.config.Travel == 'Teleport' then
+        cancelMotion()
+        humanoid.Sit = false
+        root.CFrame = CFrame.new(destination) * root.CFrame.Rotation
+        root.AssemblyLinearVelocity = Vector3.zero
+        humanoid:MoveTo(root.Position); humanoid:Move(Vector3.zero)
+        status(key, 'Arriving'); return false
+    end
+    if not current or current.owner ~= key or (current.goal - destination).Magnitude > 8 or current.character ~= player.Character then
+        cancelMotion()
+        local leg = hub.config.NoClip and destination or routeLeg(player.Character, humanoid, root, destination)
+        if not leg then status(key, 'Waiting for the next route section to load'); return false end
+        current = {owner = key, goal = destination, priority = priority, touched = clock(), started = clock(),
+            character = player.Character, position = root.Position, progressAt = clock(), nodes = {}, index = 1, planning = true,
+            leg = leg}
+        hub.motion = current
+        humanoid.Sit = false
+        if hub.config.NoClip then current.nodes = {destination}; current.planning = false
+        else
+            task.spawn(function()
+                local ok, nodes = pcall(function()
+                    local path = Pathfinding:CreatePath({AgentRadius = 2, AgentHeight = 5, AgentCanJump = true, WaypointSpacing = 5})
+                    path:ComputeAsync(root.Position, current.leg)
+                    if path.Status ~= Enum.PathStatus.Success then error('No walking route found') end
+                    return path:GetWaypoints()
+                end)
+                if hub.motion ~= current or not hub.alive then return end
+                current.planning = false
+                if ok and type(nodes) == 'table' and #nodes > 0 then
+                    current.nodes = nodes; current.index = 2; current.progressAt = clock(); current.position = root.Position
+                else current.failed = true; status(key, tostring(nodes):sub(1, 120)) end
+            end)
+        end
+    end
+    current.touched = clock()
+    if current.failed then
+        hub.motionFailures[key] = {goal = current.goal, at = clock(), reason = 'No walking route found'}
+        hub.lastTravelError = key .. ': No walking route found'
+        cancelMotion(key); hub.workers[key].next = clock() + 2; return false
+    end
+    if current.planning then
+        status(key, 'Finding a route')
+        if clock() - current.started > 10 then
+            hub.motionFailures[key] = {goal = current.goal, at = clock(), reason = 'Route planning timed out'}
+            hub.lastTravelError = key .. ': Route planning timed out'
+            cancelMotion(key); status(key, 'Route timed out; retrying')
+        end
+    else status(key, 'Travelling') end
+    return false
+end
+local function moveStep(dt)
+    local motion = hub.motion
+    if not motion then return end
+    local _, humanoid, root = body()
+    if not root or motion.character ~= player.Character or not hub.config[motion.owner] then cancelMotion(); return end
+    if clock() - motion.touched > 2 or hub.config.Fly then cancelMotion(); return end
+    if motion.planning or motion.failed then return end
+    if motion.leg and (motion.leg - motion.goal).Magnitude > 2
+        and Vector3.new(root.Position.X - motion.leg.X, 0, root.Position.Z - motion.leg.Z).Magnitude < 3
+        and math.abs(root.Position.Y - motion.leg.Y) < 7 then
+        cancelMotion(motion.owner); hub.workers[motion.owner].next = 0
+        status(motion.owner, 'Continuing to the next route section'); return
+    end
+    local node = motion.nodes[motion.index]
+    if not node then node = motion.leg or motion.goal end
+    local position = typeof(node) == 'Vector3' and node or node.Position
+    if (root.Position - motion.goal).Magnitude < 2 then
+        cancelMotion(); hub.workers[motion.owner].next = 0; return
+    end
+    local delta = position - root.Position
+    if hub.config.Travel == 'Walk' then
+        if typeof(node) ~= 'Vector3' and node.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
+        local flat = Vector3.new(delta.X, 0, delta.Z)
+        if flat.Magnitude < 2.5 and math.abs(delta.Y) < 7 then motion.index = motion.index + 1 end
+        humanoid:MoveTo(position)
+    else
+        local remaining = Core.clamp(hub.config.TravelSpeed, 20, 600) * math.min(math.max(dt, 0), 0.1)
+        for _ = 1, 64 do
+            local waypoint = motion.nodes[motion.index]
+            local endpoint = waypoint or motion.leg or motion.goal
+            local destination = typeof(endpoint) == 'Vector3' and endpoint or endpoint.Position
+            if typeof(endpoint) ~= 'Vector3' then destination = destination + Vector3.new(0, humanoid.HipHeight + root.Size.Y / 2, 0) end
+            local offset = destination - root.Position
+            if offset.Magnitude <= 0.05 then
+                if not waypoint then break end
+                motion.index = motion.index + 1
+            elseif remaining <= 0 then break
+            else
+                local step = math.min(offset.Magnitude, remaining)
+                root.CFrame = CFrame.new(root.Position + offset.Unit * step) * root.CFrame.Rotation
+                remaining = remaining - step
+                if step >= offset.Magnitude then
+                    if not waypoint then break end
+                    motion.index = motion.index + 1
+                else break end
+            end
+        end
+        root.AssemblyLinearVelocity = Vector3.zero
+        humanoid:MoveTo(root.Position); humanoid:Move(Vector3.zero)
+        if (root.Position - (motion.leg or motion.goal)).Magnitude <= 0.1 then
+            if motion.leg and (motion.leg - motion.goal).Magnitude > 2 then cancelMotion(motion.owner) end
+            hub.workers[motion.owner].next = 0
+        end
+    end
+    if (root.Position - motion.position).Magnitude > 1 then motion.position = root.Position; motion.progressAt = clock() end
+    if clock() - motion.progressAt > 3 then
+        hub.motionFailures[motion.owner] = {goal = motion.goal, at = clock(), reason = 'Movement made no progress'}
+        hub.lastTravelError = motion.owner .. ': Movement made no progress'
+        cancelMotion(); status(motion.owner, 'Movement stalled; retrying route')
+    end
+end
+local function request(key, folder, name, args, callback)
+    local id = folder .. '/' .. name
+    if hub.pending[id] then status(key, 'Waiting for the previous server request'); return false end
+    local event = remote(folder, name, 'RemoteFunction')
+    if not event then status(key, 'Waiting for ' .. name .. ' to load'); return false end
+    local pending = {key = key, at = clock()}
+    hub.pending[id] = pending
+    task.spawn(function()
+        local result = table.pack(pcall(event.InvokeServer, event, table.unpack(args or {})))
+        if hub.pending[id] == pending then hub.pending[id] = nil end
+        if not hub.alive then return end
+        if not result[1] then
+            status(key, 'Server error: ' .. tostring(result[2]):sub(1, 100))
+            hub.errors[key] = tostring(result[2]); hub.workers[key].next = clock() + 3
+            if hub.spending and hub.spending.key == key then hub.spending = nil end
+            return
+        end
+        hub.errors[key] = nil
+        local ok, err = pcall(callback, table.unpack(result, 2, result.n))
+        if not ok then hub.errors[key] = tostring(err); status(key, 'Retrying: ' .. tostring(err):sub(1, 100)) end
+    end)
+    return true
+end
+local function fire(key, folder, name, ...)
+    local event = remote(folder, name, 'RemoteEvent')
+    if not event then status(key, 'Waiting for ' .. name .. ' to load'); return false end
+    local ok, err = pcall(event.FireServer, event, ...)
+    if not ok then hub.errors[key] = tostring(err); status(key, tostring(err)); return false end
+    hub.errors[key] = nil
+    return true
+end
+local function spend(key, price, folder, name, args, acknowledge, callback)
+    if hub.spending then status(key, 'Waiting for the current purchase'); return false end
+    if not Core.affordable(money(), price, hub.config.CashReserve) then status(key, 'Waiting for enough cash'); return false end
+    local token = {key = key, cash = money(), price = price, at = clock(), ack = acknowledge}
+    hub.spending = token
+    local sent = request(key, folder, name, args, function(a, b)
+        token.responded = true
+        local accepted, reason = Core.accepted(a, b)
+        if type(a) == 'table' and type(a.Owned) == 'table' then accepted = acknowledge(a) end
+        if not accepted then
+            if hub.spending == token then hub.spending = nil end
+            status(key, reason or 'Purchase was declined')
+            hub.workers[key].next = clock() + 3
+        else
+            status(key, 'Purchase accepted; confirming your data')
+            hub.workers[key].next = clock() + math.max(1.25, hub.workers[key].interval + 0.4)
+        end
+        if callback then callback(a, b, accepted) end
+    end)
+    if not sent and hub.spending == token then hub.spending = nil end
+    return sent
+end
+local function ownEggs()
+    local eggs = {}
+    for _, egg in ipairs(children(workspace:FindFirstChild('PlacedEggs'))) do
+        if attr(egg, 'OwnerUserId') == player.UserId then eggs[#eggs + 1] = egg end
+    end
+    return eggs
+end
+local function eggInventory()
+    local bag = player:FindFirstChild('EggBag')
+    if bag then return #bag:GetChildren() end
+    local count, seen = 0, {}
+    for _, holder in ipairs(holders()) do
+        for _, tool in ipairs(children(holder)) do
+            local uid = attr(tool, 'Uid')
+            if attr(tool, 'ItemType') == 'AssetEgg' and uid and not seen[uid] then count = count + 1; seen[uid] = true end
+        end
+    end
+    return count
+end
+local function promptPosition(prompt)
+    local parent = prompt.Parent
+    if parent and parent:IsA('Attachment') then return parent.WorldPosition end
+    local root = part(parent)
+    return root and root.Position
+end
+local function eggModel(prompt)
+    local node = prompt.Parent
+    local nearest
+    while node and node ~= workspace do
+        if node:IsA('Model') then
+            nearest = nearest or node
+            if attr(node, 'Creature') ~= nil or attr(node, 'EggLabel') ~= nil then return node end
+        end
+        if node.Name == 'EggBeds' or node.Name == 'LooseEggs' then return nearest end
+        node = node.Parent
+    end
+end
+local function eggRarity(egg)
+    local art = moduleAt('AnimalIndexArt')
+    if not art or type(art.TIER) ~= 'table' then return nil end
+    local creature = attr(egg, 'Creature')
+    if type(creature) ~= 'string' or creature == '' then creature = egg.Name end
+    if attr(egg, 'Universal') == true and art.TIER.Limited then return 'Limited' end
+    local limited = moduleAt('LimitedStand')
+    if limited and type(limited.of) == 'function' then
+        local ok, entry = pcall(limited.of, creature)
+        if ok and entry and art.TIER.Limited then return 'Limited' end
+    end
+    local premium = moduleAt('PremiumEggs')
+    if (premium or not RS:FindFirstChild('PremiumEggs')) and type(art.premiumSetOf) == 'function' then
+        local ok, rarity = pcall(art.premiumSetOf, creature)
+        if ok and (rarity == 'Pookie' or rarity == 'Fanxys') and art.TIER[rarity] then return rarity end
+    end
+    for _, name in ipairs({'DawnBloomEgg', 'AdminMegaEgg', 'DailyRewardsConfig'}) do
+        local catalog = moduleAt(name)
+        local lookup = catalog and (name == 'DailyRewardsConfig' and catalog.liveOf or catalog.tierOf)
+        if type(lookup) == 'function' then
+            local ok, value = pcall(lookup, creature)
+            local rarity = type(value) == 'table' and value.tier or value
+            if ok and type(rarity) == 'string' and art.TIER[rarity] then return rarity end
+        end
+    end
+    local roster = moduleAt('EggRoster')
+    if roster and type(art.rankInRoster) == 'function' and type(art.tierAt) == 'function' then
+        local ok, rank, zone = pcall(art.rankInRoster, creature)
+        if ok and Core.number(rank) and Core.number(zone) then
+            local entry = type(roster.ZONES) == 'table' and roster.ZONES[zone]
+            if rank < 0 or rank ~= math.floor(rank) or not entry or type(entry.creatures) ~= 'table'
+                or not entry.creatures[rank + 1] then return nil end
+            local success, _, rarity = pcall(art.tierAt, zone, rank)
+            if success and type(rarity) == 'string' and art.TIER[rarity] then return rarity end
+        end
+    end
+end
+local function rarityOptions()
+    for _, name in ipairs({'EggRoster', 'LimitedStand', 'PremiumEggs', 'DawnBloomEgg', 'AdminMegaEgg', 'DailyRewardsConfig'}) do moduleAt(name) end
+    local options, order = {'All rarities'}, {}
+    for i, name in ipairs({'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary', 'Mythical', 'Exotic', 'Secret',
+        'Immortal', 'Divine', 'Dread', 'Ethereal', 'Unreal', 'Veritas', 'Draconis', 'Forbidden', 'Demonic',
+        'Glitched', 'Spectral', 'Fanxys', 'Pookie', 'Limited'}) do order[name] = i end
+    local art = moduleAt('AnimalIndexArt')
+    for name in pairs(art and type(art.TIER) == 'table' and art.TIER or {}) do
+        if type(name) == 'string' and name ~= 'Robux' then options[#options + 1] = name end
+    end
+    table.sort(options, function(a, b)
+        if a == 'All rarities' or b == 'All rarities' then return a == 'All rarities' and b ~= 'All rarities' end
+        local first, second = order[a] or math.huge, order[b] or math.huge
+        if first ~= second then return first < second end
+        return a < b
+    end)
+    return options
+end
+local function matchesEggFilter(target)
+    local prompt = target and target.prompt
+    if not prompt or prompt.Name ~= 'EggPrompt' or not prompt.Parent then return false end
+    local egg = eggModel(prompt)
+    if not egg or target.egg and target.egg ~= egg then return false end
+    return hub.config.EggRarity == 'All rarities' or eggRarity(egg) == hub.config.EggRarity
+end
+local function validStealTarget(target)
+    local prompt = target and target.prompt
+    if not prompt or prompt.Name ~= 'EggPrompt' or not prompt.Parent or not prompt:IsDescendantOf(workspace) or not prompt.Enabled
+        or (hub.promptCooldown[prompt] or 0) > clock() then return false end
+    local egg = eggModel(prompt)
+    if not egg or attr(egg, 'HeldBy') ~= nil then return false end
+    return matchesEggFilter(target)
+end
+local refreshEggPrompts
+local function stealTarget()
+    local _, _, root = body()
+    if not root then return nil end
+    if refreshEggPrompts then refreshEggPrompts() end
+    local choices = {}
+    local scan = {loaded = 0, available = 0, matching = 0, disabled = 0, cooling = 0}
+    for prompt in pairs(hub.eggPrompts or {}) do
+        if prompt.Parent and prompt:IsDescendantOf(workspace) and prompt.Name == 'EggPrompt' then
+            scan.loaded = scan.loaded + 1
+            if not prompt.Enabled then scan.disabled = scan.disabled + 1
+            elseif (hub.promptCooldown[prompt] or 0) > clock() then scan.cooling = scan.cooling + 1
+            elseif eggModel(prompt) and attr(eggModel(prompt), 'HeldBy') == nil then scan.available = scan.available + 1 end
+        end
+        if validStealTarget({prompt = prompt}) then
+            local egg, pos = eggModel(prompt), promptPosition(prompt)
+            if egg and pos then
+                choices[#choices + 1] = {prompt = prompt, egg = egg, position = pos, distance = (root.Position - pos).Magnitude}
+                scan.matching = scan.matching + 1
+            end
+        end
+    end
+    hub.stealScan = scan
+    table.sort(choices, function(a, b)
+        return a.distance < b.distance
+    end)
+    return choices[1]
+end
+local function eggApproach(target, pos)
+    local character, humanoid, root = body()
+    if not root then return nil end
+    local range = math.max(0.5, target.prompt.MaxActivationDistance - 1)
+    if (root.Position - pos).Magnitude <= range then return root.Position end
+    if target.approachOrigin and (target.approachOrigin - pos).Magnitude > 2 then
+        target.approaches = nil; target.approachIndex = nil
+    end
+    if not target.approaches then
+        local params = RaycastParams.new()
+        params.FilterType = Enum.RaycastFilterType.Exclude
+        params.FilterDescendantsInstances = {character, target.egg}
+        params.RespectCanCollide = true; params.IgnoreWater = true
+        local outward = Vector3.new(root.Position.X - pos.X, 0, root.Position.Z - pos.Z)
+        outward = outward.Magnitude > 0.1 and outward.Unit or Vector3.new(1, 0, 0)
+        local approaches = {}
+        for _, scale in ipairs({0.65, 0.35}) do
+            for _, angle in ipairs({0, math.pi / 3, -math.pi / 3, math.pi * 2 / 3, -math.pi * 2 / 3, math.pi}) do
+                local direction = Vector3.new(outward.X * math.cos(angle) - outward.Z * math.sin(angle), 0,
+                    outward.X * math.sin(angle) + outward.Z * math.cos(angle))
+                local offset = direction * range * scale
+                local origin = Vector3.new(pos.X + offset.X, pos.Y + 20, pos.Z + offset.Z)
+                local hit = workspace:Raycast(origin, Vector3.new(0, -math.max(80, math.abs(pos.Y - root.Position.Y) + 40), 0), params)
+                if hit and hit.Normal.Y >= 0.6 then
+                    local stand = hit.Position + Vector3.new(0, humanoid.HipHeight + root.Size.Y / 2, 0)
+                    if (stand - pos).Magnitude <= range then approaches[#approaches + 1] = stand end
+                end
+            end
+        end
+        table.sort(approaches, function(a, b) return (a - root.Position).Magnitude < (b - root.Position).Magnitude end)
+        if #approaches == 0 then return nil end
+        target.approaches = approaches; target.approachIndex = 1; target.approachOrigin = pos
+    end
+    return target.approaches[target.approachIndex]
+end
+local function failEggApproach(target)
+    local failure = hub.motionFailures.AutoSteal
+    if not failure or not target.approaches then return false end
+    hub.motionFailures.AutoSteal = nil
+    local approach = target.approaches[target.approachIndex]
+    if not approach or (failure.goal - approach).Magnitude > 2 then return false end
+    target.approachIndex = target.approachIndex + 1
+    if target.approachIndex > #target.approaches then
+        hub.promptCooldown[target.prompt] = clock() + 8; hub.stealTarget = nil
+        status('AutoSteal', 'Egg route is blocked; trying another egg')
+    else status('AutoSteal', 'Trying another approach to the egg') end
+    hub.workers.AutoSteal.next = clock() + 0.2
+    return true
+end
+local function newWorker(key, interval, callback)
+    hub.workers[key] = {interval = interval, next = 0, run = callback}
+    hub.statuses[key] = 'Off'
+end
+newWorker('AutoSteal', 0.2, function()
+    local key = 'AutoSteal'
+    if not ready(key) or pausedForEvent(key) then return end
+    local revision = hub.stealRevision
+    if attr(player.Character, 'CarryingEgg') == true then
+        local plot = myPlot()
+        local home = plot and part(plot:FindFirstChild('SpawnPoint') or plot:FindFirstChild('BaseSpawn'))
+        if not home then status(key, 'Waiting for your base'); return end
+        if travel(key, home.Position + Vector3.new(0, 3, 0), 7, 700) then status(key, 'Waiting for the egg claim') end
+        return
+    end
+    local maximum = attr(RS:FindFirstChild('EggCarryConfig'), 'MaxEggs')
+    if Core.number(maximum) and eggInventory() >= maximum then cancelMotion(key); status(key, 'Egg bag is full; place or hatch eggs'); return end
+    if hub.hold then
+        status(key, hub.hold.phase == 'confirm' and 'Waiting for the game to confirm the egg' or 'Holding the egg prompt')
+        return
+    end
+    local target = hub.stealTarget
+    if not validStealTarget(target) then target = stealTarget(); hub.stealTarget = target end
+    if not target then
+        cancelMotion(key)
+        local art = moduleAt('AnimalIndexArt')
+        if hub.config.EggRarity ~= 'All rarities' and (not art or type(art.TIER) ~= 'table') then
+            status(key, 'Waiting for egg rarity data')
+        else
+            status(key, hub.config.EggRarity == 'All rarities' and 'Waiting for an available egg'
+                or 'Waiting for an available ' .. hub.config.EggRarity .. ' egg')
+        end
+        return
+    end
+    local pos = promptPosition(target.prompt)
+    if not pos then hub.stealTarget = nil; return end
+    local _, _, travelRoot = body()
+    if travelRoot and hub.config.Travel ~= 'Teleport' and not hub.config.NoClip and (travelRoot.Position - pos).Magnitude > 400 then
+        travel(key, pos, 20, 250); return
+    end
+    if failEggApproach(target) then return end
+    local approach = eggApproach(target, pos)
+    if not approach then
+        cancelMotion(key)
+        requestStream(pos)
+        target.groundWaitAt = target.groundWaitAt or clock()
+        if target.approaches or clock() - target.groundWaitAt > 2 then
+            hub.promptCooldown[target.prompt] = clock() + 4; hub.stealTarget = nil
+            status(key, 'No walkable approach to this egg; trying another')
+        else status(key, 'Waiting for ground near the egg to load') end
+        return
+    end
+    target.groundWaitAt = nil
+    if not travel(key, approach, 1.5, 250) then failEggApproach(target); return end
+    local _, humanoid, root = body()
+    if not root or (root.Position - pos).Magnitude > target.prompt.MaxActivationDistance then return end
+    if not hub.alive or not hub.config.AutoSteal or hub.stealRevision ~= revision
+        or not validStealTarget(target) then return end
+    humanoid:MoveTo(root.Position); humanoid:Move(Vector3.zero)
+    local original = hub.promptDefaults[target.prompt]
+    local duration = original or target.prompt.HoldDuration
+    if duration <= 0 then duration = Core.number(attr(RS:FindFirstChild('EggCarryConfig'), 'StealHold')) or 1.2 end
+    local hold = {prompt = target.prompt, ends = clock() + duration + 0.1, target = target, at = clock(), native = false, watches = {},
+        previousDuration = original or target.prompt.HoldDuration, duration = duration, phase = 'hold',
+        claimBefore = hub.claimCounter, revision = revision}
+    hub.hold = hold
+    local connected, connection = pcall(function()
+        return target.prompt.Triggered:Connect(function(who)
+            if hub.hold == hold and (who == nil or who == player) then hold.triggered = true end
+        end)
+    end)
+    if connected then hold.connection = connection end
+    local function recheckHeldEgg()
+        if hub.hold ~= hold or hold.triggered then return end
+        if not matchesEggFilter(target) or eggModel(hold.prompt) ~= target.egg or attr(target.egg, 'HeldBy') ~= nil then
+            releaseHold(); cancelMotion(key); hub.stealTarget = nil
+            status(key, 'Egg changed; checking the selected rarity again')
+        end
+    end
+    for _, name in ipairs({'Creature', 'Universal', 'HeldBy'}) do
+        hold.watches[#hold.watches + 1] = target.egg:GetAttributeChangedSignal(name):Connect(recheckHeldEgg)
+    end
+    hold.watches[#hold.watches + 1] = target.egg:GetPropertyChangedSignal('Name'):Connect(recheckHeldEgg)
+    hold.watches[#hold.watches + 1] = target.prompt.AncestryChanged:Connect(recheckHeldEgg)
+    target.prompt.HoldDuration = duration
+    local ok = pcall(function() target.prompt:InputHoldBegin() end)
+    hold.native = ok
+    hub.stealStats.native = hub.stealStats.native + 1
+    if not ok and type(environment.fireproximityprompt or fireproximityprompt) ~= 'function' then
+        releaseHold(); status(key, 'Prompt input is unavailable'); hub.workers[key].next = clock() + 3
+    end
+end)
+local function placeBag(key)
+    if not ready(key) or pausedForEvent(key) then return end
+    if eggInventory() == 0 then status(key, 'Waiting for eggs in your bag'); return end
+    local plot = myPlot()
+    local yard = plot and part(plot:FindFirstChild('PetYard'))
+    if not yard then status(key, 'Waiting for your egg yard'); return end
+    if not travel(key, yard.Position + Vector3.new(0, 3, 0), 22, 450) then return end
+    request(key, 'EggRemotes', 'PlaceAllEggs', {}, function(result)
+        local accepted, reason = Core.accepted(result)
+        if accepted then status(key, 'Placed ' .. tostring(result.placed or 0) .. ' eggs')
+        else status(key, reason or 'Your egg yard is full'); hub.workers[key].next = clock() + 3 end
+    end)
+end
+newWorker('AutoPlace', 0.65, function() placeBag('AutoPlace') end)
+newWorker('AutoHatch', 0.65, function()
+    local key = 'AutoHatch'
+    if not ready(key) or pausedForEvent(key) then return end
+    local growth = moduleAt('EggGrowth')
+    local readyCount = 0
+    for _, egg in ipairs(ownEggs()) do
+        local ripe = attr(egg, 'Ready') == true
+        if not ripe and growth and type(growth.alpha) == 'function' then
+            local ok, value = pcall(growth.alpha, egg, workspace:GetServerTimeNow())
+            ripe = ok and type(value) == 'number' and value >= 1
+        end
+        if ripe then readyCount = readyCount + 1 end
+    end
+    if readyCount == 0 then
+        if eggInventory() > 0 then placeBag(key) else status(key, 'Waiting for eggs to finish growing') end
+        return
+    end
+    request(key, 'EggRemotes', 'OpenAllEggs', {}, function(result)
+        local accepted, reason = Core.accepted(result)
+        if accepted then
+            local waitTime = Core.clamp(result.wait or 0, 0, 30)
+            hub.workers[key].next = clock() + math.max(0.65, waitTime + 0.4)
+            status(key, 'Opening ready eggs')
+        else status(key, reason); hub.workers[key].next = clock() + 3 end
+    end)
+end)
+local function pets()
+    local result, known, locked, seen = {}, {}, {}, {}
+    local petTool = moduleAt('PetTool')
+    local function add(object, placed)
+        local uid = attr(object, 'Uid')
+        if type(uid) ~= 'string' or uid == '' or seen[uid] then return end
+        seen[uid] = true; known[uid] = true
+        if attr(object, 'Locked') == true or attr(object, 'Favorite') == true or attr(object, 'Favourited') == true then locked[uid] = true end
+        local rate = Core.number(attr(object, 'EarnRate'))
+        if rate == nil and attr(object, 'Creature') ~= nil and petTool
+            and type(petTool.attrsOf) == 'function' and type(petTool.earnRateOf) == 'function' then
+            local ok, data = pcall(petTool.attrsOf, object)
+            if ok and type(data) == 'table' then
+                local estimated, value = pcall(petTool.earnRateOf, data)
+                if estimated then rate = Core.number(value) end
+            end
+        end
+        result[#result + 1] = {uid = uid, rate = rate, placed = placed}
+    end
+    for _, object in ipairs(children(workspace:FindFirstChild('PlacedPets'))) do
+        if attr(object, 'OwnerUserId') == player.UserId then add(object, true) end
+    end
+    for _, object in ipairs(children(player:FindFirstChild('PetBag'))) do add(object, false) end
+    for _, holder in ipairs(holders()) do
+        for _, object in ipairs(children(holder)) do
+            if object:IsA('Tool') and attr(object, 'ItemType') == 'Asset' then add(object, false) end
+        end
+    end
+    return result, known, locked
+end
+local function petCapacity()
+    local level = Core.number(attr(player, 'BaseLevel'))
+    if not level then return nil end
+    return Core.number(attr(RS:FindFirstChild('BaseConfig'), 'Capacity_' .. math.floor(level)))
+end
+local function applyLocks(key, known, locked)
+    local instance = RS:FindFirstChild('PetLockMock')
+    local lockModule = moduleAt('PetLockMock')
+    if instance and not lockModule then
+        status(key, 'Waiting for pet lock data'); hub.workers[key].next = clock() + 0.5; return false
+    end
+    if not lockModule then return true end
+    if type(lockModule.active) ~= 'function' or type(lockModule.is) ~= 'function' then
+        status(key, 'Waiting for pet lock data'); return false
+    end
+    local ok, enabled = pcall(lockModule.active)
+    if not ok then status(key, 'Waiting for pet lock data'); return false end
+    if enabled then
+        for uid in pairs(known) do
+            local checked, value = pcall(lockModule.is, uid)
+            if not checked then status(key, 'Waiting for pet lock data'); return false end
+            if value == true then locked[uid] = true end
+        end
+    end
+    return true
+end
+newWorker('AutoEquip', 2, function()
+    local key = 'AutoEquip'
+    if not ready(key) or pausedForEvent(key) then return end
+    if not myPlot() then status(key, 'Waiting for your base'); return end
+    local list = pets()
+    if #list == 0 then status(key, 'Waiting for pets'); return end
+    request(key, 'PetRemotes', 'EquipBest', {}, function(a, b)
+        local ok, reason = Core.accepted(a, b)
+        status(key, ok and 'Best pets equipped' or reason)
+    end)
+end)
+newWorker('AutoSell', 3, function()
+    local key = 'AutoSell'
+    if not ready(key) or pausedForEvent(key) then return end
+    local capacity = petCapacity()
+    if not capacity then status(key, 'Waiting for your pen capacity'); return end
+    local list, known, locked = pets()
+    local keep, reason = Core.best(list, capacity)
+    if not keep then status(key, reason); return end
+    if not applyLocks(key, known, locked) then return end
+    request(key, 'SellRemotes', 'ListSellable', {}, function(rows)
+        if not hub.config[key] then return end
+        if type(rows) ~= 'table' then status(key, 'Waiting for sellable inventory'); return end
+        local current, currentKnown, currentLocked = pets()
+        local currentKeep = Core.best(current, petCapacity() or capacity)
+        for uid in pairs(locked) do currentLocked[uid] = true end
+        if not applyLocks(key, currentKnown, currentLocked) then return end
+        local ids = Core.sellable(rows, currentKeep, currentKnown, currentLocked)
+        if #ids == 0 then status(key, 'No weaker pets to sell'); return end
+        request(key, 'SellRemotes', 'SellItems', {ids}, function(a, b)
+            local ok, err = Core.accepted(a, b)
+            status(key, ok and 'Sold weaker inventory pets' or err)
+        end)
+    end)
+end)
+local function tableSeat()
+    local plot = myPlot()
+    local tableModel = plot and plot:FindFirstChild('MukbangTable')
+    local seat = tableModel and (tableModel:FindFirstChild('Seat') or tableModel:FindFirstChildWhichIsA('Seat', true))
+    return seat and seat:IsA('Seat') and seat or nil
+end
+local function sit(key)
+    local _, humanoid = body()
+    local seat = tableSeat()
+    if not seat then status(key, 'Build your table first'); return false end
+    if humanoid.SeatPart == seat then cancelMotion(key); return true end
+    if seat.Occupant and seat.Occupant ~= humanoid then status(key, 'Your table seat is occupied'); return false end
+    if not travel(key, seat.Position + Vector3.new(0, 2, 0), 5, 150) then return false end
+    seat:Sit(humanoid)
+    return false
+end
+newWorker('AutoSit', 0.7, function()
+    if ready('AutoSit') and not pausedForEvent('AutoSit') and sit('AutoSit') then status('AutoSit', 'Sitting at your table') end
+end)
+local function foodModels()
+    local root = find(workspace, 'OrderedFood', tostring(player.UserId))
+    local result = {}
+    for _, item in ipairs(children(root)) do
+        if item:IsA('Model') and not attr(item, 'Eaten') then result[#result + 1] = item end
+    end
+    return result
+end
+newWorker('AutoCook', 0.7, function()
+    local key = 'AutoCook'
+    if not ready(key) or pausedForEvent(key) then return end
+    if not sit(key) or attr(player, 'Eating') ~= true then status(key, 'Getting ready at your table'); return end
+    local foodConfig = RS:FindFirstChild('FoodConfig')
+    local foodMenu = moduleAt('FoodMenu')
+    if not foodConfig or not foodMenu or not foodMenu.categories or not foodMenu.terms then status(key, 'Waiting for the food menu'); return end
+    local existing, occupied = foodModels(), {}
+    for _, model in ipairs(existing) do occupied[tostring(attr(model, 'Category')) .. '/' .. tostring(attr(model, 'Dish', model.Name))] = true end
+    if #existing >= (Core.number(attr(foodConfig, 'MaxDishes')) or 6) then status(key, 'Waiting for space on the table'); return end
+    local best, bestPrice
+    for _, category in ipairs(foodMenu.categories()) do
+        for index, item in ipairs(category.items) do
+            local id = category.name .. '/' .. item.Name
+            local terms = foodMenu.terms(index, #category.items)
+            if terms and terms.level <= (Core.number(attr(player, 'TableLevel')) or 0) and not occupied[id]
+                and (hub.foodCooldown[id] or 0) <= clock() and Core.affordable(money(), terms.price, hub.config.CashReserve)
+                and (not bestPrice or terms.price < bestPrice) then
+                best, bestPrice = {category.name, item.Name}, terms.price
+            end
+        end
+    end
+    if not best then status(key, 'Waiting for an affordable available dish'); return end
+    if hub.spending then status(key, 'Waiting for the current purchase'); return end
+    local old = money()
+    if fire(key, 'FoodRemotes', 'OrderBatch', {best}) then
+        hub.foodCooldown[best[1] .. '/' .. best[2]] = clock() + math.max(1, Core.number(attr(foodConfig, 'DishCooldown')) or 60)
+        if bestPrice > 0 then hub.spending = {key = key, cash = old, price = bestPrice, at = clock(), responded = true, ack = function() return false end} end
+        hub.workers[key].next = clock() + math.max(0.7, Core.number(attr(foodConfig, 'OrderCooldown')) or 0.35)
+        status(key, 'Ordered food for your table')
+    end
+end)
+newWorker('AutoEat', 0.3, function()
+    local key = 'AutoEat'
+    if not ready(key) or pausedForEvent(key) then return end
+    if not sit(key) or attr(player, 'Eating') ~= true then status(key, 'Getting ready at your table'); return end
+    for _, food in ipairs(foodModels()) do
+        if attr(food, 'Delivering') ~= true then
+            if fire(key, 'FoodRemotes', 'Eat', food) then
+                status(key, 'Eating delivered food')
+                hub.workers[key].next = clock() + math.max(0.3, Core.number(attr(RS:FindFirstChild('FoodConfig'), 'EatCooldown')) or 2)
+            end
+            return
+        end
+    end
+    status(key, 'Waiting for delivered food')
+end)
+local function upgrade(key, signName, levelName, folder, name)
+    if not ready(key) or pausedForEvent(key) then return end
+    local plot = myPlot()
+    if not plot then status(key, 'Waiting for your base'); return end
+    local sign = plot:FindFirstChild(signName)
+    local cost = Core.number(attr(sign, 'Cost'))
+    if cost == nil then status(key, 'Upgrade is maxed or its price is still loading'); return end
+    if not Core.affordable(money(), cost, hub.config.CashReserve) then cancelMotion(key); status(key, 'Waiting for enough cash'); return end
+    local level = attr(player, levelName)
+    local target = part(sign)
+    if not target then status(key, 'Waiting for your upgrade sign'); return end
+    if not travel(key, target.Position + Vector3.new(0, 2, 0), 14, 350) then return end
+    if myPlot() ~= plot or attr(sign, 'Cost') ~= cost or attr(player, levelName) ~= level then return end
+    spend(key, cost, folder, name, {}, function() return attr(player, levelName) ~= level end)
+end
+newWorker('UpgradeTable', 0.8, function() upgrade('UpgradeTable', 'TableUpgradeSign', 'TableLevel', 'TableRemotes', 'Upgrade') end)
+newWorker('UpgradePen', 0.8, function() upgrade('UpgradePen', 'PenUpgradeSign', 'BaseLevel', 'PetRemotes', 'UpgradePen') end)
+newWorker('AutoTraits', 2, function()
+    local key = 'AutoTraits'
+    if not ready(key) or pausedForEvent(key) then return end
+    local catalog = moduleAt('TrailSystem', 'TrailConfig')
+    if not catalog or not catalog.RarityOrder or not catalog.PriceOf or not catalog.GetShopData then status(key, 'Waiting for the trait stall catalog'); return end
+    if not hub.trailState or clock() - (hub.trailStateAt or 0) > 8 then
+        request(key, 'TrailSystem', 'GetTrailShopState', {}, function(value)
+            if type(value) == 'table' and value.Loaded == true then hub.trailState = value; hub.trailStateAt = clock()
+            else status(key, 'Waiting for your trail ownership data') end
+        end)
+        return
+    end
+    local state = hub.trailState
+    if type(state.Owned) ~= 'table' then hub.trailState = nil; return end
+    local highest = 0
+    for index, rarity in ipairs(catalog.RarityOrder) do if state.Owned[rarity] == true or state.Equipped == rarity then highest = index end end
+    for index = highest + 1, #catalog.RarityOrder do
+        local rarity = catalog.RarityOrder[index]
+        local data = catalog.GetShopData(rarity)
+        local price = Core.number(catalog.PriceOf(rarity))
+        if data and data.RobuxOnly ~= true and price then
+            local shopConfig = RS:FindFirstChild('ShopConfig')
+            local sale = Core.number(attr(shopConfig, 'TrailSaleCash_' .. rarity))
+            local ending = Core.number(attr(shopConfig, 'TrailSaleEndsUtc'))
+            if sale and sale >= 0 and sale < price and ending and workspace:GetServerTimeNow() < ending then price = sale end
+            if not Core.affordable(money(), price, hub.config.CashReserve) then status(key, 'Waiting for enough cash'); return end
+            local stall = part(find(workspace, 'SellStand', 'TraitProxy'))
+            if not stall then status(key, 'Waiting for the trait stall'); return end
+            if not travel(key, stall.Position, 10, 300) then return end
+            spend(key, price, 'TrailSystem', 'BuyTrailCash', {rarity}, function(value)
+                return type(value) == 'table' and type(value.Owned) == 'table' and value.Owned[rarity] == true
+            end, function(value, _, accepted)
+                if type(value) == 'table' then hub.trailState = value; hub.trailStateAt = clock() end
+                if accepted then hub.equipTrail = rarity end
+            end)
+            return
+        end
+    end
+    status(key, 'Best available cash trail is owned')
+end)
+local function gatePosition()
+    for _, gate in ipairs(children(workspace:FindFirstChild('RiftGates'))) do
+        local root = part(gate)
+        local tp = root and root:FindFirstChild('TP')
+        if tp and tp:IsA('Attachment') then return tp.WorldPosition end
+        if root then return (root.CFrame * CFrame.new(0, 6.3, 0)).Position end
+    end
+end
+local function riftState()
+    local config = RS:FindFirstChild('BossLoopConfig')
+    local entrants = Core.number(attr(workspace, 'RiftEntrants')) or 0
+    local maximum = Core.number(attr(config, 'MaxEntrants')) or 8
+    return {
+        gate = gatePosition(), disabled = attr(config, 'Enabled') == false,
+        state = attr(workspace, 'RiftState', 'idle'), untilAt = Core.number(attr(workspace, 'RiftOpenUntil')),
+        fighting = attr(player, 'BossLoopFight') ~= nil, downed = attr(player.Character, 'GlitchDowned') == true,
+        full = entrants >= maximum, late = attr(config, 'LateEntry') ~= false,
+    }
+end
+local function enterPortal(key)
+    if not ready(key) then return end
+    local state = riftState()
+    local allowed, reason = Core.rift(state, workspace:GetServerTimeNow())
+    if not allowed then status(key, reason); return end
+    if attr(player.Character, 'CarryingEgg') == true then status(key, 'Finish carrying your egg before entering'); return end
+    if not travel(key, state.gate, 2.5, 900, true) then return end
+    if fire(key, 'BossLoopRemotes', 'Enter') then status(key, 'Entering the rift'); hub.workers[key].next = clock() + 2 end
+end
+newWorker('AutoPortal', 0.5, function() enterPortal('AutoPortal') end)
+newWorker('InfiniteRespawn', 0.7, function()
+    if not hub.wasInFight then status('InfiniteRespawn', 'Join a rift fight first'); return end
+    if attr(player, 'BossLoopFight') ~= nil then status('InfiniteRespawn', 'Fight active; waiting for revival if downed'); return end
+    enterPortal('InfiniteRespawn')
+end)
+local function bossSnapshot()
+    local config = moduleAt('GlitchInvasionConfig')
+    if not config or not config.Boss or not config.Boss.snapshot then return nil end
+    local ok, snapshot = pcall(config.Boss.snapshot)
+    return ok and snapshot or nil
+end
+local function bossPosition(snapshot, arena)
+    local now = workspace:GetServerTimeNow()
+    local origin = Vector3.new(snapshot.CX, snapshot.FloorY, snapshot.CZ)
+    local moves = moduleAt('GlitchBossMoves')
+    local encoded = attr(arena, 'Body')
+    if moves and moves.bodyAt and type(encoded) == 'string' and encoded ~= '' then
+        if hub.bossBodyEncoded ~= encoded or hub.bossBodyArena ~= arena then
+            hub.bossBodyEncoded, hub.bossBodyArena = encoded, arena
+            local ok, bodyPlan = pcall(HttpService.JSONDecode, HttpService, encoded)
+            hub.bossBody = ok and type(bodyPlan) == 'table' and bodyPlan or nil
+        end
+        if hub.bossBody then
+            local ok, mode, x, y, z = pcall(moves.bodyAt, hub.bossBody, now, snapshot)
+            if ok and mode and x and y and z then
+                if mode == 'rim' then return nil end
+                return origin + Vector3.new(x, y, z)
+            end
+        end
+    end
+    if (Core.number(snapshot.ArenaVersion) or 1) >= 2 then return nil end
+    local patterns = moduleAt('GlitchBossPatterns')
+    if patterns and patterns.perch then
+        local chosen, newest, perch, perchTime = nil, -math.huge, 'H', -math.huge
+        for id, record in pairs(hub.attacks) do
+            local attack = record.value
+            if attack and attack.endsAt and attack.endsAt + 1 < now then hub.attacks[id] = nil
+            elseif attack then
+                if attack.t0 <= now and attack.t0 > perchTime then perch, perchTime = attack.perch or 'H', attack.t0 end
+                local ok, state, x, y, z = pcall(attack.bossPoseAt, attack, now)
+                if ok and state and x and y and z and attack.t0 > newest then chosen = Vector3.new(x, y, z); newest = attack.t0 end
+            end
+        end
+        if chosen then return origin + chosen end
+        local ok, x, y, z = pcall(patterns.perch, perch, snapshot)
+        if ok and x and y and z then return origin + Vector3.new(x, y, z) end
+    end
+    local model = find(workspace, 'GlitchArenaLocal', 'Boss') or arena:FindFirstChild('Boss')
+    local root = part(model)
+    return root and root.Position
+end
+newWorker('AutoBoss', 0.15, function()
+    local key = 'AutoBoss'
+    if not ready(key) then return end
+    if attr(player, 'BossLoopFight') == nil then status(key, 'Enter the rift first'); cancelMotion(key); return end
+    local arena = workspace:FindFirstChild('GlitchArena')
+    if not arena or attr(arena, 'Gone') == true then status(key, 'Waiting for the arena'); return end
+    if (Core.number(attr(arena, 'BossHP')) or 1) <= 0 or attr(arena, 'LoopResult') ~= nil then status(key, 'Waiting for the next fight'); cancelMotion(key); return end
+    local config = bossSnapshot()
+    if not config then status(key, 'Waiting for boss data'); return end
+    local target = bossPosition(config, arena)
+    if not target then cancelMotion(key); status(key, 'Waiting for the boss to enter the arena'); return end
+    local character, humanoid, root = body()
+    local bat = character:FindFirstChild('Baseball Bat')
+    for _, holder in ipairs(holders()) do
+        for _, tool in ipairs(children(holder)) do
+            if tool:IsA('Tool') and (tool.Name == 'Baseball Bat' or attr(tool, 'BatKind') ~= nil) then bat = tool; break end
+        end
+        if bat then break end
+    end
+    if not bat or not bat:IsA('Tool') then status(key, 'Equip or obtain a bat first'); return end
+    if bat.Parent ~= character then humanoid:EquipTool(bat) end
+    local floorY = Core.number(config.FloorY)
+    if not floorY then status(key, 'Waiting for the arena floor'); return end
+    local goal = Vector3.new(target.X, floorY + humanoid.HipHeight + root.Size.Y / 2, target.Z - 4)
+    if not travel(key, goal, 7, 850) then return end
+    local flat = Vector3.new(target.X, root.Position.Y, target.Z)
+    if (flat - root.Position).Magnitude > 0.1 then root.CFrame = CFrame.lookAt(root.Position, flat) end
+    local cooldown = math.max(0.15, Core.number(attr(RS:FindFirstChild('BatConfig'), 'SwingCooldown')) or 0.7)
+    if fire(key, 'BatRemotes', 'Swing') then hub.workers[key].next = clock() + cooldown; status(key, 'Attacking with your bat') end
+end)
+local function bindNativeEvents()
+    local claimed = remote('EggRemotes', 'Claimed', 'RemoteEvent')
+    if claimed and hub.claimRemote ~= claimed then
+        hub.claimRemote = claimed
+        connect(claimed.OnClientEvent, function(_, zone, guardian, creature)
+            hub.claimCounter = hub.claimCounter + 1
+            if type(creature) == 'string' and creature ~= '' then
+                hub.lastClaimedEgg = {creature = creature, zone = zone, guardian = guardian, selected = hub.config.EggRarity}
+            end
+        end)
+    end
+    local attackRemote = remote('GlitchBossRemotes', 'Attack', 'RemoteEvent')
+    if attackRemote and hub.attackRemote ~= attackRemote then
+        hub.attackRemote = attackRemote
+        connect(attackRemote.OnClientEvent, function(record)
+            if not hub.alive or type(record) ~= 'table' or not record.i then return end
+            local config = bossSnapshot()
+            local patterns = moduleAt('GlitchBossPatterns')
+            if config and patterns and patterns.build then
+                local ok, attack = pcall(patterns.build, record, config)
+                if ok and attack then hub.attacks[record.i] = {value = attack} end
+            end
+        end)
+    end
+    local changed = remote('TrailSystem', 'TrailShopStateChanged', 'RemoteEvent')
+    if changed and hub.trailRemote ~= changed then
+        hub.trailRemote = changed
+        connect(changed.OnClientEvent, function(value)
+            if type(value) == 'table' then hub.trailState = value; hub.trailStateAt = clock() end
+        end)
+    end
+end
+hub.eggPrompts = setmetatable({}, {__mode = 'k'})
+local function discover(object)
+    if object:IsA('ProximityPrompt') then
+        instantPrompt(object)
+        if object.Name == 'EggPrompt' then hub.eggPrompts[object] = true end
+        if not hub.eggPromptWatches[object] then
+            hub.eggPromptWatches[object] = true
+            connect(object:GetPropertyChangedSignal('Name'), function()
+                hub.eggPrompts[object] = object.Name == 'EggPrompt' or nil
+            end)
+        end
+    end
+end
+local lastEggScan = -5
+refreshEggPrompts = function()
+    if clock() - lastEggScan < 2 then return end
+    lastEggScan = clock()
+    local roots = {}
+    for _, name in ipairs({'Zones', 'LooseEggs'}) do
+        local root = workspace:FindFirstChild(name)
+        if root then roots[#roots + 1] = root end
+    end
+    for _, object in ipairs(workspace:GetChildren()) do
+        if object:IsA('Model') and attr(object, 'EggLabel') ~= nil then roots[#roots + 1] = object end
+    end
+    for _, root in ipairs(roots) do
+        for _, object in ipairs(root:GetDescendants()) do
+            if object:IsA('ProximityPrompt') and object.Name == 'EggPrompt' then discover(object) end
+        end
+    end
+end
+connect(workspace.DescendantAdded, discover)
+for _, object in ipairs(workspace:GetDescendants()) do discover(object) end
+connect(PPS.PromptShown, instantPrompt)
+connect(player.CharacterAdded, function()
+    cancelMotion(); stopFly(); restoreCollisions(); hub.movementDefaults = nil
+    releaseHold()
+    hub.stealTarget = nil; hub.motionFailures = {}
+    hub.stealRevision = hub.stealRevision + 1
+    for _, worker in pairs(hub.workers) do worker.next = 0 end
+end)
+connect(UIS.JumpRequest, function()
+    if hub.config.InfiniteJump and clock() - (hub.lastJump or -1) >= 0.15 then
+        local _, humanoid = body()
+        if humanoid and not humanoid.Sit then humanoid:ChangeState(Enum.HumanoidStateType.Jumping); hub.lastJump = clock() end
+    end
+end)
+connect(RunService.Stepped, function()
+    if hub.alive and hub.config.NoClip and player.Character then
+        for _, object in ipairs(player.Character:GetDescendants()) do
+            if object:IsA('BasePart') then
+                if hub.collisionDefaults[object] == nil then hub.collisionDefaults[object] = object.CanCollide end
+                object.CanCollide = false
+            end
+        end
+    end
+end)
+local function playerStep()
+    local _, humanoid, root = body()
+    if not humanoid then stopFly(); return end
+    local old = hub.movementDefaults
+    if not old or old.humanoid ~= humanoid then
+        old = {humanoid = humanoid, speed = humanoid.WalkSpeed, jump = humanoid.JumpPower, height = humanoid.JumpHeight}
+        hub.movementDefaults = old
+    end
+    if hub.config.SpeedEnabled then humanoid.WalkSpeed = hub.config.WalkSpeed
+    elseif hub.speedApplied then humanoid.WalkSpeed = old.speed end
+    hub.speedApplied = hub.config.SpeedEnabled
+    if hub.config.JumpEnabled then
+        if humanoid.UseJumpPower then humanoid.JumpPower = hub.config.JumpPower
+        else humanoid.JumpHeight = hub.config.JumpPower ^ 2 / (2 * workspace.Gravity) end
+    elseif hub.jumpApplied then humanoid.JumpPower = old.jump; humanoid.JumpHeight = old.height end
+    hub.jumpApplied = hub.config.JumpEnabled
+    if not hub.config.Fly then stopFly(); return end
+    if not hub.flight then
+        cancelMotion()
+        local attachment = Instance.new('Attachment'); attachment.Name = 'SpixFly'; attachment.Parent = root
+        local velocity = Instance.new('LinearVelocity'); velocity.Attachment0 = attachment; velocity.MaxForce = math.huge
+        velocity.RelativeTo = Enum.ActuatorRelativeTo.World; velocity.Parent = root
+        local orientation = Instance.new('AlignOrientation'); orientation.Attachment0 = attachment
+        orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment; orientation.MaxTorque = math.huge; orientation.Responsiveness = 20; orientation.Parent = root
+        hub.flight = {humanoid = humanoid, platform = humanoid.PlatformStand, rotate = humanoid.AutoRotate,
+            objects = {velocity, orientation, attachment}, velocity = velocity, orientation = orientation}
+        humanoid.PlatformStand = true; humanoid.AutoRotate = false
+    end
+    local camera = workspace.CurrentCamera
+    local vertical = hub.flyUp and 1 or hub.flyDown and -1 or 0
+    if UIS:IsKeyDown(Enum.KeyCode.Space) then vertical = 1 elseif UIS:IsKeyDown(Enum.KeyCode.LeftControl) then vertical = -1 end
+    local direction = humanoid.MoveDirection + Vector3.new(0, vertical, 0)
+    if direction.Magnitude > 1 then direction = direction.Unit end
+    hub.flight.velocity.VectorVelocity = direction * hub.config.FlySpeed
+    if camera then hub.flight.orientation.CFrame = camera.CFrame.Rotation end
+end
+local lastBind = -10
+connect(RunService.Heartbeat, function(dt)
+    if not hub.alive then return end
+    local ok, err = pcall(function()
+        playerStep(); moveStep(dt)
+        if attr(player, 'BossLoopFight') ~= nil then hub.wasInFight = true end
+        if clock() - lastBind > 2 then bindNativeEvents(); lastBind = clock() end
+        local hold = hub.hold
+        if hold then
+            local _, _, root = body()
+            local pos = hold.prompt.Parent and promptPosition(hold.prompt)
+            local confirmed = attr(player.Character, 'CarryingEgg') == true or hub.claimCounter > hold.claimBefore
+            local interrupted = not hub.config.AutoSteal or not root or not pos
+                or (root.Position - pos).Magnitude > hold.prompt.MaxActivationDistance
+                or hub.stealRevision ~= hold.revision
+                or not hold.triggered and not matchesEggFilter(hold.target)
+            if confirmed or interrupted then
+                releaseHold()
+                hub.promptCooldown[hold.prompt] = clock() + 1
+                hub.hold = nil; hub.stealTarget = nil
+                if confirmed then
+                    hub.stealStats.confirmed = hub.stealStats.confirmed + 1
+                    hub.workers.AutoSteal.next = 0
+                    status('AutoSteal', 'Egg taken; bringing it home')
+                else status('AutoSteal', 'Egg interaction interrupted; retrying') end
+            elseif clock() >= hold.ends then
+                if hold.triggered and hold.phase ~= 'confirm' then
+                    hold.phase = 'confirm'; hold.ends = clock() + 3
+                    status('AutoSteal', 'Waiting for the game to confirm the egg')
+                elseif hold.phase == 'hold' then
+                    hold.phase = 'grace'; hold.ends = clock() + 0.6
+                elseif hold.phase == 'grace' then
+                    local direct = environment.fireproximityprompt or fireproximityprompt
+                    if type(direct) == 'function' and not hold.directSent and hold.prompt.Enabled then
+                        hold.directSent = true; hold.phase = 'confirm'; hold.ends = clock() + math.max(3, hold.duration + 1)
+                        hub.stealStats.direct = hub.stealStats.direct + 1
+                        status('AutoSteal', 'Retrying the prompt with direct input')
+                        hold.thread = task.spawn(function()
+                            if not hub.alive or hub.hold ~= hold or not hub.config.AutoSteal then return end
+                            local current = promptPosition(hold.prompt)
+                            local _, _, currentRoot = body()
+                            if not current or not currentRoot or not hold.prompt.Enabled
+                                or (currentRoot.Position - current).Magnitude > hold.prompt.MaxActivationDistance
+                                or hub.stealRevision ~= hold.revision or not validStealTarget(hold.target) then return end
+                            local success, reason = pcall(direct, hold.prompt)
+                            if not success and hub.hold == hold then
+                                status('AutoSteal', 'Checking whether the prompt was accepted: ' .. tostring(reason):sub(1, 80))
+                            end
+                        end)
+                    else
+                        releaseHold(); hub.stealTarget = nil
+                        hub.promptCooldown[hold.prompt] = clock() + 5
+                        hub.stealStats.timeouts = hub.stealStats.timeouts + 1
+                        status('AutoSteal', 'Prompt did not respond; trying another egg')
+                    end
+                else
+                    releaseHold(); hub.stealTarget = nil
+                    hub.promptCooldown[hold.prompt] = clock() + 5
+                    hub.stealStats.timeouts = hub.stealStats.timeouts + 1
+                    status('AutoSteal', 'Egg was not confirmed; trying another egg')
+                end
+            end
+        end
+        local spending = hub.spending
+        if spending and spending.responded then
+            local acknowledged = false
+            if spending.ack then local success, value = pcall(spending.ack); acknowledged = success and value == true end
+            local cash = money()
+            if acknowledged or (cash and spending.cash and cash < spending.cash) or clock() - spending.at > 5 then hub.spending = nil end
+        end
+        for _, requestRecord in pairs(hub.pending) do
+            if clock() - requestRecord.at > 12 then status(requestRecord.key, 'Server is taking longer; waiting without sending duplicates') end
+        end
+        if hub.equipTrail and hub.config.AutoTraits and not hub.spending then
+            local rarity = hub.equipTrail
+            hub.equipTrail = nil
+            request('AutoTraits', 'TrailSystem', 'ToggleTrailEquip', {rarity}, function(value)
+                if type(value) == 'table' then hub.trailState = value; hub.trailStateAt = clock() end
+            end)
+        end
+        for key, worker in pairs(hub.workers) do
+            if hub.config[key] and not worker.busy and clock() >= worker.next then
+                worker.next = clock() + worker.interval; worker.busy = true
+                task.spawn(function()
+                    if not hub.alive or not hub.config[key] then worker.busy = false; return end
+                    local success, reason = xpcall(worker.run, debug.traceback)
+                    worker.busy = false
+                    if not success then hub.errors[key] = tostring(reason); status(key, 'Retrying: ' .. tostring(reason):sub(1, 110)); worker.next = clock() + 3 end
+                end)
+            end
+        end
+    end)
+    if not ok then hub.errors.Runtime = tostring(err); status('Runtime', 'Retrying: ' .. tostring(err):sub(1, 110)) end
+end)
+hub.test = {travel = travel, step = moveStep, pets = pets, riftState = riftState, eggInventory = eggInventory, stealTarget = stealTarget,
+    request = request, spend = spend, upgrade = upgrade, ownEggs = ownEggs, playerStep = playerStep}
+
+local function loadUI()
+    local WindUI
+    local ok, reason = pcall(function()
+        local text = game:HttpGet('https://github.com/Footagesus/WindUI/releases/download/1.6.66/main.lua')
+        if type(loadstring) ~= 'function' then error('This client cannot load WindUI') end
+        local chunk, compileError = loadstring(text, 'SpixAnimalEggWindUI')
+        if not chunk then error(compileError) end
+        WindUI = chunk()
+        if type(WindUI) ~= 'table' or type(WindUI.CreateWindow) ~= 'function' then error('WindUI did not initialize') end
+    end)
+    if not ok then status('UI', 'WindUI load failed: ' .. tostring(reason):sub(1, 140)); warn('[Spix Hub] ' .. hub.statuses.UI); return false end
+    if not hub.alive then return false end
+    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(900, 600)
+    local width, height = math.min(650, math.max(330, viewport.X - 24)), math.min(510, math.max(320, viewport.Y - 32))
+    local window = WindUI:CreateWindow({Title = 'Steal Animal Egg', Author = 'Spix Hub  •  Version 1.0.0', Icon = 'egg',
+        Folder = 'SpixAnimalEgg', Size = UDim2.fromOffset(width, height), MinSize = Vector2.new(330, 320),
+        Theme = 'Dark', Transparent = false, Resizable = true, SideBarWidth = width < 500 and 125 or 175,
+        ToggleKey = Enum.KeyCode.RightShift, HideSearchBar = true})
+    hub.window, hub.windUI = window, WindUI
+    if window.EditOpenButton then window:EditOpenButton({Title = 'Spix Hub', Icon = 'egg', OnlyMobile = false, Enabled = true, Draggable = true}) end
+    local gui = WindUI.ScreenGui
+    local overlayRoots, repairing = {}, false
+    local orders = {ScreenGui = 2147483644, TooltipGui = 2147483645, NotificationGui = 2147483646, DropdownGui = 2147483647}
+    local function repairOverlay()
+        if not hub.alive or repairing then return end
+        repairing = true
+        for root, order in pairs(overlayRoots) do
+            pcall(function()
+                root.DisplayOrder = order; root.ResetOnSpawn = false; root.Enabled = true
+                root:SetAttribute('KeepInCutscene', true)
+                if gui and gui.Parent and root ~= gui and root.Parent ~= gui.Parent then root.Parent = gui.Parent end
+            end)
+        end
+        repairing = false
+    end
+    for name, order in pairs(orders) do
+        local root = WindUI[name]
+        if root then
+            overlayRoots[root] = order
+            for _, property in ipairs({'DisplayOrder', 'Parent', 'Enabled', 'ResetOnSpawn'}) do
+                connect(root:GetPropertyChangedSignal(property), repairOverlay)
+            end
+        end
+    end
+    repairOverlay()
+    hub.overlayRoots = overlayRoots
+    local tabs, controls, labels = {}, {}, {}
+    hub.controls = controls
+    local function tab(title, icon) local page = window:Tab({Title = title, Icon = icon}); tabs[title] = page; return page end
+    local function toggle(page, key, title, description)
+        controls[key] = page:Toggle({Title = title, Desc = description, Value = hub.config[key], Callback = function(value) hub:set(key, value == true) end})
+        if hub.workers[key] then labels[key] = controls[key] end
+    end
+    local function slider(page, key, title, minimum, maximum)
+        controls[key] = page:Slider({Title = title, Step = 1, Value = {Min = minimum, Max = maximum, Default = hub.config[key]},
+            Callback = function(value) hub:set(key, Core.clamp(value, minimum, maximum)) end})
+    end
+    local egg = tab('Eggs & Pets', 'egg')
+    toggle(egg, 'AutoSteal', 'Auto Steal', 'Take an available egg and bring it home.')
+    local stealLabel = egg:Paragraph({Title = 'Steal status', Desc = 'Off'})
+    toggle(egg, 'AutoHatch', 'Auto Hatch Eggs', 'Place bag eggs, then open them when ready.')
+    toggle(egg, 'AutoPlace', 'Auto Place Eggs', 'Place bag eggs in your own yard.')
+    toggle(egg, 'AutoEquip', 'Auto Equip Best', 'Equip the best pets using the game ranking.')
+    local rarities = rarityOptions()
+    local raritySignature = table.concat(rarities, '|')
+    controls.EggRarity = egg:Dropdown({Title = 'Egg rarity', Desc = 'Only steal eggs of this rarity.', Values = rarities,
+        Value = hub.config.EggRarity, Multi = false, AllowNone = false,
+        Callback = function(value)
+            value = Core.selection(value)
+            for _, choice in ipairs(rarityOptions()) do
+                if value == choice then hub:set('EggRarity', value); return end
+            end
+        end})
+    local economy = tab('Economy', 'utensils')
+    toggle(economy, 'AutoCook', 'Auto Cook / Order Food', 'Order affordable dishes at your table.')
+    toggle(economy, 'AutoEat', 'Auto Eat', 'Eat your food after it is delivered.')
+    toggle(economy, 'AutoSell', 'Auto Sell', 'Sell weaker bag pets. Keep eggs and your best team.')
+    slider(economy, 'CashReserve', 'Cash to keep', 0, 100000)
+    local event = tab('Event', 'door-open')
+    toggle(event, 'AutoPortal', 'Auto Enter Portal', 'Enter when the live rift opens.')
+    toggle(event, 'AutoBoss', 'Auto Boss Farm', 'Follow the boss and attack with your bat.')
+    toggle(event, 'InfiniteRespawn', 'Infinite Respawn', 'Return after respawning when entry is allowed.')
+    local riftLabel = event:Paragraph({Title = 'Glitch Rift', Desc = 'Checking the server timer…'})
+    local base = tab('Base & Upgrades', 'house')
+    toggle(base, 'UpgradeTable', 'Auto Upgrade Table', 'Buy the next affordable table level.')
+    toggle(base, 'UpgradePen', 'Auto Upgrade Pen', 'Buy more pet slots for your own base.')
+    toggle(base, 'AutoSit', 'Auto Sit At Table', 'Sit at your own table when it is free.')
+    local traits = tab('Traits & Extras', 'sparkles')
+    toggle(traits, 'AutoTraits', 'Auto Buy Traits / Trails', 'Buy the next cash trail from the trait stall.')
+    toggle(traits, 'InstantPrompt', 'Instant Proximity Prompt', 'Remove the prompt bar. Server hold checks still apply.')
+    local movement = tab('Player', 'person-standing')
+    toggle(movement, 'SpeedEnabled', 'Apply WalkSpeed', 'Use your selected walking speed.')
+    slider(movement, 'WalkSpeed', 'WalkSpeed', 8, 200)
+    toggle(movement, 'JumpEnabled', 'Apply JumpPower', 'Use your selected jump strength.')
+    slider(movement, 'JumpPower', 'JumpPower', 20, 200)
+    toggle(movement, 'NoClip', 'NoClip', 'Pass through walls and fences.')
+    toggle(movement, 'Fly', 'Fly', 'Use movement keys. Space goes up; Ctrl goes down.')
+    slider(movement, 'FlySpeed', 'Fly speed', 10, 200)
+    toggle(movement, 'InfiniteJump', 'Infinite Jump', 'Jump again while you are in the air.')
+    controls.Travel = movement:Dropdown({Title = 'Automation travel', Values = {'Walk', 'Tween', 'Teleport'}, Value = hub.config.Travel, Multi = false, AllowNone = false,
+        Callback = function(value)
+            value = Core.selection(value)
+            if value == 'Walk' or value == 'Tween' or value == 'Teleport' then hub:set('Travel', value) end
+        end})
+    slider(movement, 'TravelSpeed', 'Tween speed', 20, 600)
+    local settings = tab('Settings', 'settings')
+    local diagnostics = settings:Paragraph({Title = 'Status', Desc = 'Ready. Turn on a feature to begin.'})
+    settings:Button({Title = 'Copy diagnostics', Callback = function()
+        local lines = {'Spix Hub ' .. hub.build, 'Version ' .. hub.version, 'Cash: ' .. tostring(money()), 'Egg bag: ' .. eggInventory(),
+            'Steal input: native=' .. hub.stealStats.native .. ' direct=' .. hub.stealStats.direct .. ' confirmed=' .. hub.stealStats.confirmed .. ' timeouts=' .. hub.stealStats.timeouts}
+        local scan = hub.stealScan
+        lines[#lines + 1] = 'Egg rarity: ' .. hub.config.EggRarity .. ' | Loaded=' .. (scan.loaded or 0)
+            .. ' available=' .. (scan.available or 0) .. ' matching=' .. (scan.matching or 0)
+            .. ' disabled=' .. (scan.disabled or 0) .. ' cooling=' .. (scan.cooling or 0)
+        local target = hub.stealTarget
+        local claimed = hub.lastClaimedEgg
+        if claimed then
+            lines[#lines + 1] = 'Last claimed creature: ' .. claimed.creature .. ' | Selected rarity: ' .. claimed.selected
+        end
+        if target then
+            local _, _, root = body()
+            local pos = promptPosition(target.prompt)
+            lines[#lines + 1] = 'Egg target: ' .. target.egg.Name .. ' | Rarity=' .. tostring(eggRarity(target.egg))
+                .. ' | Range=' .. tostring(target.prompt.MaxActivationDistance)
+                .. ' | Distance=' .. tostring(root and pos and math.floor((root.Position - pos).Magnitude))
+                .. ' | Approach=' .. tostring(target.approachIndex or 0) .. '/' .. tostring(target.approaches and #target.approaches or 0)
+        end
+        lines[#lines + 1] = 'Travel: ' .. hub.config.Travel .. ' | Owner=' .. tostring(hub.motion and hub.motion.owner)
+            .. ' | Planning=' .. tostring(hub.motion and hub.motion.planning) .. ' | Last error=' .. tostring(hub.lastTravelError)
+        for key, value in pairs(hub.statuses) do if hub.config[key] then lines[#lines + 1] = key .. ': ' .. value end end
+        for key, value in pairs(hub.errors) do lines[#lines + 1] = key .. ' error: ' .. value end
+        local fn = environment.setclipboard or setclipboard
+        if type(fn) == 'function' then fn(table.concat(lines, '\n')) else warn(table.concat(lines, '\n')) end
+    end})
+    settings:Button({Title = 'Stop all automation', Callback = function()
+        for key in pairs(hub.workers) do hub:set(key, false); if controls[key] then controls[key]:Set(false) end end
+    end})
+    settings:Button({Title = 'Unload Spix Hub', Callback = function() hub:destroy() end})
+    local changelog = tab('Changelogs', 'history')
+    changelog:Paragraph({Title = '1.0.0', Desc = 'First release for Steal Animal Egg. Egg farming, cash upgrades, food, rift farming, and player controls.'})
+    changelog:Paragraph({Title = 'Fixes', Desc = 'Fixed hidden dropdowns and silent steal input.'})
+    changelog:Paragraph({Title = 'Egg filter', Desc = 'Auto Steal now filters by egg rarity. Changing rarity clears the old target.'})
+    changelog:Paragraph({Title = 'Auto Steal', Desc = 'Fixed egg discovery and stalled routes. Tries nearby ground and another egg when blocked.'})
+    changelog:Paragraph({Title = 'Egg rarity fix', Desc = 'Uses the creature catalog for egg rarity. Keeps your selection and stops when a held egg changes.'})
+    changelog:Paragraph({Title = 'Long trips', Desc = 'Far trips use shorter ground routes.'})
+    changelog:Paragraph({Title = 'Faster tween', Desc = 'Faster default speed, smoother waypoint travel, and quicker returns after stealing.'})
+    egg:Select()
+    local lastStatus = -5
+    connect(RunService.Heartbeat, function()
+        if not hub.alive or clock() - lastStatus < 1 then return end
+        lastStatus = clock()
+        pcall(function()
+            local freshRarities = rarityOptions()
+            local signature = table.concat(freshRarities, '|')
+            if signature ~= raritySignature and controls.EggRarity.Refresh then
+                controls.EggRarity:Refresh(freshRarities); raritySignature = signature
+            end
+            local lines = {'Cash: ' .. tostring(money() or 'loading') .. '  |  Eggs: ' .. eggInventory()}
+            for key in pairs(hub.workers) do if hub.config[key] then lines[#lines + 1] = key .. ': ' .. (hub.statuses[key] or 'Starting') end end
+            diagnostics:SetDesc(table.concat(lines, '\n'))
+            local scan = hub.stealScan
+            stealLabel:SetDesc((hub.statuses.AutoSteal or 'Off') .. '\nEggs loaded: ' .. (scan.loaded or 0)
+                .. '  |  Matching: ' .. (scan.matching or 0) .. '  |  Filter: ' .. hub.config.EggRarity)
+            local state = attr(workspace, 'RiftState', 'idle')
+            local nextAt = Core.number(attr(workspace, 'RiftNextAt')) or Core.number(attr(workspace, 'RiftOpenAt'))
+            local seconds = nextAt and math.max(0, math.ceil(nextAt - workspace:GetServerTimeNow()))
+            riftLabel:SetDesc('State: ' .. tostring(state) .. (seconds and ('  |  Next: ' .. math.floor(seconds / 60) .. 'm ' .. seconds % 60 .. 's') or '  |  Waiting for timer'))
+        end)
+    end)
+    if UIS.TouchEnabled then
+        local touchGui = Instance.new('ScreenGui'); touchGui.Name = 'SpixFlight'; touchGui.ResetOnSpawn = false
+        touchGui.DisplayOrder = 2147483647; touchGui.Parent = player:WaitForChild('PlayerGui'); hub.touchGui = touchGui
+        for index, spec in ipairs({{'Up', 'flyUp'}, {'Down', 'flyDown'}}) do
+            local button = Instance.new('TextButton'); button.Name = spec[1]; button.Text = spec[1]
+            button.Size = UDim2.fromOffset(64, 44); button.Position = UDim2.new(1, -80, 0.5, (index - 1) * 52)
+            button.BackgroundColor3 = Color3.fromRGB(35, 38, 44); button.TextColor3 = Color3.fromRGB(225, 226, 230); button.Parent = touchGui
+            connect(button.InputBegan, function(input)
+                if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then hub[spec[2]] = true end
+            end)
+            connect(button.InputEnded, function() hub[spec[2]] = false end)
+        end
+        connect(UIS.InputEnded, function(input) if input.UserInputType == Enum.UserInputType.Touch then hub.flyUp = false; hub.flyDown = false end end)
+        connect(RunService.Heartbeat, function() touchGui.Enabled = hub.config.Fly end)
+    end
+    status('UI', 'Ready')
+    return true
+end
+hub.loadUI = loadUI
+task.spawn(function()
+    while hub.alive do
+        local success, result = pcall(loadUI)
+        if success and result then break end
+        if not success then status('UI', 'Retrying UI: ' .. tostring(result):sub(1, 120)) end
+        task.wait(5)
+    end
+end)
+return hub
