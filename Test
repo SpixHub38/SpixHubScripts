@@ -64,6 +64,12 @@ function Core.selection(value)
     if type(value) == 'table' then value = value.Title or value[1] end
     return type(value) == 'string' and value or nil
 end
+function Core.lineNotice(value)
+    if type(value) ~= 'string' then return false end
+    local message = value:lower():gsub('<[^>]*>', ''):gsub('%s+', ' ')
+    return message:find('steal', 1, true) ~= nil and message:find('line', 1, true) ~= nil
+        and (message:find('back', 1, true) ~= nil or message:find('cross', 1, true) ~= nil)
+end
 if rawget(_G, '__SPIX_EGG_TEST_MODE') == 'core' then return Core end
 
 local Players = game:GetService('Players')
@@ -92,9 +98,9 @@ local hub = {
         AutoSit = false, AutoTraits = false, InstantPrompt = false,
         SpeedEnabled = false, JumpEnabled = false, WalkSpeed = 24, JumpPower = 60,
         NoClip = false, Fly = false, InfiniteJump = false, FlySpeed = 60,
-        Travel = 'Tween', TravelSpeed = 300, EggRarity = previousRarity or 'All rarities', CashReserve = 0,
+        Travel = 'Tween', TravelSpeed = 600, EggRarity = previousRarity or 'All rarities', CashReserve = 0,
     },
-    build = 'egg-8', version = '1.0.0', core = Core,
+    build = 'egg-9', version = '1.0.0', core = Core,
 }
 environment.SpixAnimalEgg = hub
 local clock = os.clock
@@ -241,11 +247,13 @@ function hub:set(key, value)
     if key == 'Fly' and value then releaseHold(); cancelMotion() end
     if key == 'AutoSteal' and not value then
         releaseHold(); hub.stealTarget = nil; self.motionFailures.AutoSteal = nil; self.stealRevision = self.stealRevision + 1
+        self.stealCycle = nil
     end
     if key == 'EggRarity' then
         releaseHold(); cancelMotion('AutoSteal'); self.stealTarget = nil
         self.motionFailures.AutoSteal = nil
         self.stealRevision = self.stealRevision + 1
+        self.stealCycle = nil
         if self.workers.AutoSteal then self.workers.AutoSteal.next = 0 end
         local control = self.controls and self.controls.EggRarity
         if control and type(control.Select) == 'function' then pcall(control.Select, control, value) end
@@ -297,6 +305,37 @@ local function routeLeg(character, humanoid, root, destination)
         return hit.Position + Vector3.new(0, humanoid.HipHeight + root.Size.Y / 2, 0)
     end
     requestStream(desired)
+end
+local function tweenSpeed(owner)
+    local speed = Core.clamp(hub.config.TravelSpeed, 20, 6000)
+    if owner ~= 'AutoSteal' then return speed end
+    if clock() >= (hub.guardSpeedAt or 0) then
+        local zoneSpeed, observed = 0, 0
+        for _, zone in ipairs(children(workspace:FindFirstChild('Zones'))) do
+            zoneSpeed = math.max(zoneSpeed, Core.number(attr(zone, 'GuardianSpeed')) or 0)
+        end
+        for _, guardian in ipairs(children(workspace:FindFirstChild('ActiveGuardians'))) do
+            if guardian:IsA('Model') and attr(guardian, 'IsGuardian') == true then
+                local humanoid = guardian:FindFirstChildOfClass('Humanoid')
+                if humanoid and humanoid.Health > 0 then
+                    observed = math.max(observed, Core.number(humanoid.WalkSpeed) or 0)
+                    local root = guardian:FindFirstChild('HumanoidRootPart')
+                    if root and root:IsA('BasePart') then
+                        local velocity = root.AssemblyLinearVelocity
+                        observed = math.max(observed, Core.number(Vector3.new(velocity.X, 0, velocity.Z).Magnitude) or 0)
+                    end
+                end
+            end
+        end
+        local config = RS:FindFirstChild('GuardConfig')
+        local catchUp = Core.clamp(attr(config, 'CatchUpMax', 1), 1, 10)
+        local rush = Core.clamp(attr(config, 'RushBoost', 1), 1, 5)
+        hub.guardSpeedFloor = math.min(6000, math.max(600, zoneSpeed * catchUp * rush * 1.35 + 75, observed * 1.5 + 75))
+        hub.guardSpeedAt = clock() + 0.25
+    end
+    speed = math.max(speed, hub.guardSpeedFloor or 600)
+    hub.effectiveStealSpeed = speed
+    return speed
 end
 local function travel(key, destination, reach, priority, teleport)
     local _, humanoid, root = body()
@@ -388,7 +427,7 @@ local function moveStep(dt)
         if flat.Magnitude < 2.5 and math.abs(delta.Y) < 7 then motion.index = motion.index + 1 end
         humanoid:MoveTo(position)
     else
-        local remaining = Core.clamp(hub.config.TravelSpeed, 20, 600) * math.min(math.max(dt, 0), 0.1)
+        local remaining = tweenSpeed(motion.owner) * math.min(math.max(dt, 0), 0.1)
         for _ = 1, 64 do
             local waypoint = motion.nodes[motion.index]
             local endpoint = waypoint or motion.leg or motion.goal
@@ -664,6 +703,108 @@ local function newWorker(key, interval, callback)
     hub.workers[key] = {interval = interval, next = 0, run = callback}
     hub.statuses[key] = 'Off'
 end
+local function stealBoundary()
+    local config = RS:FindFirstChild('GuardConfig')
+    local line = Core.number(attr(config, 'LineZ')) or Core.number(attr(RS:FindFirstChild('EggCarryConfig'), 'ClaimZ'))
+    return line, math.max(8, Core.number(attr(config, 'LineClearance')) or 8)
+end
+local function resetStealLine(reason)
+    if not hub.alive or not hub.config.AutoSteal then return end
+    releaseHold(); cancelMotion('AutoSteal')
+    hub.stealTarget = nil; hub.stealCycle = nil
+    hub.lastLineNotice = tostring(reason); hub.lineNoticeAt = clock()
+    hub.stealRevision = hub.stealRevision + 1
+    hub.workers.AutoSteal.next = 0
+    status('AutoSteal', 'Resetting the steal line before trying again')
+end
+hub.noticeWatches = setmetatable({}, {__mode = 'k'})
+local function watchNativeNotice(object)
+    if not object:IsA('TextLabel') or hub.noticeWatches[object] then return end
+    local parent = object.Parent
+    local native = false
+    while parent do
+        if parent.Name == 'ErrorNotification' or parent.Name == 'UniNotification' then native = true; break end
+        parent = parent.Parent
+    end
+    if not native then return end
+    hub.noticeWatches[object] = true
+    local function readNotice()
+        if not hub.alive or not hub.config.AutoSteal or not object.Parent or not Core.lineNotice(object.Text) then return end
+        if clock() - (hub.lineNoticeAt or -10) < 1 then return end
+        resetStealLine(object.Text)
+    end
+    local changed = connect(object:GetPropertyChangedSignal('Text'), readNotice)
+    connect(object.Destroying, function() changed:Disconnect(); hub.noticeWatches[object] = nil end)
+    readNotice()
+end
+local function watchPlayerGui(gui)
+    if not gui:IsA('PlayerGui') then return end
+    for _, object in ipairs(gui:GetDescendants()) do watchNativeNotice(object) end
+    connect(gui.DescendantAdded, watchNativeNotice)
+end
+local playerGui = player:FindFirstChild('PlayerGui')
+if playerGui then watchPlayerGui(playerGui) end
+connect(player.ChildAdded, watchPlayerGui)
+local function lineGround(position)
+    local character, humanoid, root = body()
+    if not root then return nil end
+    local params = RaycastParams.new(); params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {character}; params.RespectCanCollide = true; params.IgnoreWater = true
+    local hit = workspace:Raycast(position + Vector3.new(0, 80, 0), Vector3.new(0, -300, 0), params)
+    if hit and hit.Normal.Y >= 0.6 then return hit.Position + Vector3.new(0, humanoid.HipHeight + root.Size.Y / 2, 0) end
+    requestStream(position)
+end
+local function crossStealLine(target)
+    local line, clearance = stealBoundary()
+    if not line then
+        if hub.lastLineNotice then status('AutoSteal', 'Waiting for the steal-line position to load'); return false end
+        return true
+    end
+    local _, _, root = body()
+    if not root then return false end
+    local cycle = hub.stealCycle
+    if not cycle or cycle.line ~= line or cycle.character ~= player.Character then
+        cycle = {line = line, phase = 'safe', character = player.Character, target = target}
+        hub.stealCycle = cycle
+    end
+    if cycle.phase == 'ready' then return true end
+    local pos = promptPosition(target.prompt)
+    if not pos then return false end
+    local zone = find(workspace, 'Zones')
+    local corridor
+    for _, area in ipairs(children(zone)) do
+        if Core.number(attr(area, 'Zone')) == 1 or area.Name:match('^Zone1_') then corridor = area:FindFirstChild('BiomePart'); break end
+    end
+    local x = pos.X
+    if corridor and corridor:IsA('BasePart') then
+        x = Core.clamp(x, corridor.Position.X - corridor.Size.X / 2 + 8, corridor.Position.X + corridor.Size.X / 2 - 8)
+    end
+    local margin = clearance + 8
+    if cycle.phase == 'safe' then
+        if root.Position.Z < line + margin then
+            cycle.safeAt = nil
+            local safe = lineGround(Vector3.new(x, root.Position.Y, line + margin + 2))
+            if not safe then status('AutoSteal', 'Waiting for ground beyond the steal line'); return false end
+            travel('AutoSteal', safe, 1, 700)
+            status('AutoSteal', 'Crossing back beyond the steal line'); return false
+        end
+        cancelMotion('AutoSteal')
+        cycle.safeAt = cycle.safeAt or clock()
+        if clock() - cycle.safeAt < 0.35 then status('AutoSteal', 'Letting the server register the line reset'); return false end
+        cycle.phase = 'entry'
+    end
+    if cycle.phase == 'entry' then
+        local entry = lineGround(Vector3.new(x, root.Position.Y, line - margin - 2))
+        if not entry then status('AutoSteal', 'Waiting for ground at the steal-line entrance'); return false end
+        if not travel('AutoSteal', entry, 1, 700) then status('AutoSteal', 'Crossing into the egg area'); return false end
+        if root.Position.Z > line - margin then return false end
+        cycle.entryAt = cycle.entryAt or clock()
+        if clock() - cycle.entryAt < 0.3 then status('AutoSteal', 'Confirming entry across the steal line'); return false end
+        cycle.phase = 'ready'; hub.lastLineNotice = nil
+        hub.lineResets = (hub.lineResets or 0) + 1
+    end
+    return true
+end
 newWorker('AutoSteal', 0.2, function()
     local key = 'AutoSteal'
     if not ready(key) or pausedForEvent(key) then return end
@@ -694,10 +835,12 @@ newWorker('AutoSteal', 0.2, function()
         end
         return
     end
+    if not crossStealLine(target) then return end
     local pos = promptPosition(target.prompt)
     if not pos then hub.stealTarget = nil; return end
     local _, _, travelRoot = body()
     if travelRoot and hub.config.Travel ~= 'Teleport' and not hub.config.NoClip and (travelRoot.Position - pos).Magnitude > 400 then
+        target.reachAt = nil
         travel(key, pos, 20, 250); return
     end
     if failEggApproach(target) then return end
@@ -713,9 +856,14 @@ newWorker('AutoSteal', 0.2, function()
         return
     end
     target.groundWaitAt = nil
-    if not travel(key, approach, 1.5, 250) then failEggApproach(target); return end
+    if not travel(key, approach, 1.5, 250) then target.reachAt = nil; failEggApproach(target); return end
     local _, humanoid, root = body()
-    if not root or (root.Position - pos).Magnitude > target.prompt.MaxActivationDistance then return end
+    if not root or (root.Position - pos).Magnitude > target.prompt.MaxActivationDistance then target.reachAt = nil; return end
+    if stealBoundary() then
+        target.reachAt = target.reachAt or clock()
+        local lag = Core.clamp(attr(RS:FindFirstChild('EggCarryConfig'), 'HoldReachLag', 0.15), 0.1, 0.5)
+        if clock() - target.reachAt < lag then status(key, 'Letting the server register egg reach'); return end
+    end
     if not hub.alive or not hub.config.AutoSteal or hub.stealRevision ~= revision
         or not validStealTarget(target) then return end
     humanoid:MoveTo(root.Position); humanoid:Move(Vector3.zero)
@@ -1135,6 +1283,15 @@ local function bindNativeEvents()
             end
         end)
     end
+    if not hub.catchWatch then
+        hub.catchWatch = true
+        local lastCatch = Core.number(attr(player, 'GuardCatches')) or 0
+        connect(player:GetAttributeChangedSignal('GuardCatches'), function()
+            local catches = Core.number(attr(player, 'GuardCatches')) or lastCatch
+            if catches > lastCatch then resetStealLine('Guardian catch; recrossing the steal line') end
+            lastCatch = catches
+        end)
+    end
     local attackRemote = remote('GlitchBossRemotes', 'Attack', 'RemoteEvent')
     if attackRemote and hub.attackRemote ~= attackRemote then
         hub.attackRemote = attackRemote
@@ -1194,6 +1351,7 @@ connect(player.CharacterAdded, function()
     cancelMotion(); stopFly(); restoreCollisions(); hub.movementDefaults = nil
     releaseHold()
     hub.stealTarget = nil; hub.motionFailures = {}
+    hub.stealCycle = nil; hub.guardSpeedAt = 0
     hub.stealRevision = hub.stealRevision + 1
     for _, worker in pairs(hub.workers) do worker.next = 0 end
 end)
@@ -1271,6 +1429,7 @@ connect(RunService.Heartbeat, function(dt)
                 hub.hold = nil; hub.stealTarget = nil
                 if confirmed then
                     hub.stealStats.confirmed = hub.stealStats.confirmed + 1
+                    hub.stealCycle = nil
                     hub.workers.AutoSteal.next = 0
                     status('AutoSteal', 'Egg taken; bringing it home')
                 else status('AutoSteal', 'Egg interaction interrupted; retrying') end
@@ -1302,12 +1461,14 @@ connect(RunService.Heartbeat, function(dt)
                         releaseHold(); hub.stealTarget = nil
                         hub.promptCooldown[hold.prompt] = clock() + 5
                         hub.stealStats.timeouts = hub.stealStats.timeouts + 1
+                        hub.stealCycle = nil
                         status('AutoSteal', 'Prompt did not respond; trying another egg')
                     end
                 else
                     releaseHold(); hub.stealTarget = nil
                     hub.promptCooldown[hold.prompt] = clock() + 5
                     hub.stealStats.timeouts = hub.stealStats.timeouts + 1
+                    hub.stealCycle = nil
                     status('AutoSteal', 'Egg was not confirmed; trying another egg')
                 end
             end
@@ -1344,6 +1505,7 @@ connect(RunService.Heartbeat, function(dt)
     if not ok then hub.errors.Runtime = tostring(err); status('Runtime', 'Retrying: ' .. tostring(err):sub(1, 110)) end
 end)
 hub.test = {travel = travel, step = moveStep, pets = pets, riftState = riftState, eggInventory = eggInventory, stealTarget = stealTarget,
+    tweenSpeed = tweenSpeed, resetStealLine = resetStealLine,
     request = request, spend = spend, upgrade = upgrade, ownEggs = ownEggs, playerStep = playerStep}
 
 local function loadUI()
@@ -1450,7 +1612,7 @@ local function loadUI()
             value = Core.selection(value)
             if value == 'Walk' or value == 'Tween' or value == 'Teleport' then hub:set('Travel', value) end
         end})
-    slider(movement, 'TravelSpeed', 'Tween speed', 20, 600)
+    slider(movement, 'TravelSpeed', 'Tween speed', 20, 6000)
     local settings = tab('Settings', 'settings')
     local diagnostics = settings:Paragraph({Title = 'Status', Desc = 'Ready. Turn on a feature to begin.'})
     settings:Button({Title = 'Copy diagnostics', Callback = function()
@@ -1475,6 +1637,9 @@ local function loadUI()
         end
         lines[#lines + 1] = 'Travel: ' .. hub.config.Travel .. ' | Owner=' .. tostring(hub.motion and hub.motion.owner)
             .. ' | Planning=' .. tostring(hub.motion and hub.motion.planning) .. ' | Last error=' .. tostring(hub.lastTravelError)
+        lines[#lines + 1] = 'Steal line: ' .. tostring(hub.stealCycle and hub.stealCycle.phase)
+            .. ' | Crossings=' .. tostring(hub.lineResets or 0) .. ' | Last notice=' .. tostring(hub.lastLineNotice)
+            .. ' | Effective tween speed=' .. tostring(hub.effectiveStealSpeed)
         for key, value in pairs(hub.statuses) do if hub.config[key] then lines[#lines + 1] = key .. ': ' .. value end end
         for key, value in pairs(hub.errors) do lines[#lines + 1] = key .. ' error: ' .. value end
         local fn = environment.setclipboard or setclipboard
@@ -1492,6 +1657,7 @@ local function loadUI()
     changelog:Paragraph({Title = 'Egg rarity fix', Desc = 'Uses the creature catalog for egg rarity. Keeps your selection and stops when a held egg changes.'})
     changelog:Paragraph({Title = 'Long trips', Desc = 'Far trips use shorter ground routes.'})
     changelog:Paragraph({Title = 'Faster tween', Desc = 'Faster default speed, smoother waypoint travel, and quicker returns after stealing.'})
+    changelog:Paragraph({Title = 'Steal line', Desc = 'Recrosses the line after a catch or reset notice. Tween speed adapts to loaded guardians.'})
     egg:Select()
     local lastStatus = -5
     connect(RunService.Heartbeat, function()
