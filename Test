@@ -100,7 +100,7 @@ local hub = {
         NoClip = false, Fly = false, InfiniteJump = false, FlySpeed = 60,
         Travel = 'Tween', TravelSpeed = 600, EggRarity = previousRarity or 'All rarities', CashReserve = 0,
     },
-    build = 'egg-15', version = '1.0.0', core = Core,
+    build = 'egg-16', version = '1.0.0', core = Core,
 }
 environment.SpixAnimalEgg = hub
 local clock = os.clock
@@ -762,12 +762,19 @@ local function stealTarget()
     end)
     return choices[1]
 end
+local function stealReach(prompt)
+    local visible = math.max(0, Core.number(prompt.MaxActivationDistance) or 0)
+    local config = RS:FindFirstChild('EggCarryConfig')
+    local native = Core.number(attr(config, 'PromptReach'))
+    if native and native > 0 and attr(config, 'HoldNeedsReach') ~= false then return math.min(visible, native) end
+    return visible
+end
 local function eggApproach(target, pos)
     local character, humanoid, root = body()
     if not root then return nil end
-    local range = math.max(0.5, target.prompt.MaxActivationDistance - 1)
+    local range = math.max(0.5, stealReach(target.prompt) - 1)
     if (root.Position - pos).Magnitude <= range and not (hub.motion and hub.motion.owner == 'AutoSteal' and hub.motion.air) then return root.Position end
-    if target.approachOrigin and (target.approachOrigin - pos).Magnitude > 2 then
+    if target.approachRange ~= range or target.approachOrigin and (target.approachOrigin - pos).Magnitude > 2 then
         target.approaches = nil; target.approachIndex = nil
     end
     if not target.approaches then
@@ -793,7 +800,7 @@ local function eggApproach(target, pos)
         end
         table.sort(approaches, function(a, b) return (a - root.Position).Magnitude < (b - root.Position).Magnitude end)
         if #approaches == 0 then return nil end
-        target.approaches = approaches; target.approachIndex = 1; target.approachOrigin = pos
+        target.approaches = approaches; target.approachIndex = 1; target.approachOrigin = pos; target.approachRange = range
     end
     return target.approaches[target.approachIndex]
 end
@@ -836,7 +843,8 @@ local function resetStealLine(reason)
         local _, _, root = body()
         local target = hub.stealTrip and hub.stealTrip.target or hub.stealTarget
         hub.lastLineState = {at = clock(), position = root and root.Position, target = target and promptPosition(target.prompt),
-            stage = hub.stealTrip and hub.stealTrip.stage, anchor = hub.safeZoneAnchor, native = hub.nativeSafeZone}
+            stage = hub.stealTrip and hub.stealTrip.stage, anchor = hub.safeZoneAnchor, native = hub.nativeSafeZone,
+            reach = target and stealReach(target.prompt)}
     end
     local trip = hub.stealTrip
     local delivering = rejected and trip and (trip.stage == 'return' or trip.stage == 'claim')
@@ -916,6 +924,21 @@ local function laneX(x, center)
     end
     return x
 end
+local function clearBoundaryWalk(character, humanoid, root, destination)
+    local delta = destination - root.Position
+    if delta.Magnitude > 96 then return false end
+    local params = RaycastParams.new(); params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {character}; params.RespectCanCollide = true; params.IgnoreWater = true
+    local count = math.max(1, math.ceil(delta.Magnitude / 4))
+    for index = 0, count do
+        local point = root.Position + delta * (index / count)
+        local hit = workspace:Raycast(point + Vector3.new(0, 8, 0), Vector3.new(0, -16, 0), params)
+        if not hit or hit.Normal.Y < 0.6 or math.abs(hit.Position.Y + rootHeight(character, humanoid, root) - point.Y) > 3 then
+            requestStream(point); return false
+        end
+    end
+    return airClear(root.Position, destination, Vector3.new(root.Size.X + 1, math.max(1, root.Size.Y), root.Size.Z + 1), params)
+end
 local function walkBoundary(cycle, destination, staging, stage)
     local _, _, root = body()
     if not root then return false end
@@ -935,6 +958,18 @@ local function walkBoundary(cycle, destination, staging, stage)
             cycle.staging = nil
         end
         cycle.walkStage = stage
+    end
+    local failure = hub.motionFailures.AutoSteal
+    if failure and failure.reason == 'No walking route found' and (failure.goal - destination).Magnitude <= 2
+        and clock() - failure.at <= 6 then
+        local character, humanoid = body()
+        if clearBoundaryWalk(character, humanoid, root, destination) then
+            cancelMotion('AutoSteal')
+            hub.motion = {owner = 'AutoSteal', goal = destination, leg = destination, nodes = {destination}, index = 1,
+                character = character, mode = 'Walk', priority = 700, reach = 1.5, touched = clock(), started = clock(),
+                position = root.Position, progressAt = clock(), planning = false, boundaryDirect = true}
+            hub.motionFailures.AutoSteal = nil; hub.boundaryFallbacks = (hub.boundaryFallbacks or 0) + 1
+        end
     end
     local arrived = travel('AutoSteal', destination, 1.5, 700, false, 'Walk')
     motion = hub.motion
@@ -986,7 +1021,9 @@ local function crossStealLine(target)
         local gap = safe - root.Position
         if root.Position.Z < line + clearance or Vector3.new(gap.X, 0, gap.Z).Magnitude > 3 or math.abs(gap.Y) > 6 then
             if not walkBoundary(cycle, safe, staging, 'out') then
-                cycle.safeAt = nil; status('AutoSteal', 'Walking back across the steal line'); return false
+                cycle.safeAt = nil
+                if not hub.motion or not hub.motion.air then status('AutoSteal', 'Walking back across the steal line') end
+                return false
             end
         end
         cancelMotion('AutoSteal')
@@ -998,7 +1035,11 @@ local function crossStealLine(target)
         local entry = lineGround(Vector3.new(x, root.Position.Y, line - margin - 4))
         local staging = safeLineGround(line, clearance, Vector3.new(x, root.Position.Y, line + margin + 4))
         if not entry or not staging then cycle.entryAt = nil; status('AutoSteal', 'Waiting for ground at the steal-line entrance'); return false end
-        if not walkBoundary(cycle, entry, staging, 'in') then cycle.entryAt = nil; status('AutoSteal', 'Walking into the egg area'); return false end
+        if not walkBoundary(cycle, entry, staging, 'in') then
+            cycle.entryAt = nil
+            if not hub.motion or not hub.motion.air then status('AutoSteal', 'Walking into the egg area') end
+            return false
+        end
         if root.Position.Z > line - margin then cycle.entryAt = nil; return false end
         cycle.entryAt = cycle.entryAt or clock()
         if clock() - cycle.entryAt < cycle.entrySettle then status('AutoSteal', 'Settling inside the egg area'); return false end
@@ -1156,7 +1197,7 @@ newWorker('AutoSteal', 0.2, function()
     target.groundWaitAt = nil
     if not travel(key, approach, 1.5, 700) then target.reachAt = nil; failEggApproach(target); return end
     local _, humanoid, root = body()
-    if not root or (root.Position - pos).Magnitude > target.prompt.MaxActivationDistance then target.reachAt = nil; return end
+    if not root or (root.Position - pos).Magnitude > stealReach(target.prompt) then target.reachAt = nil; return end
     if stealBoundary() then
         target.reachAt = target.reachAt or clock()
         local lag = Core.clamp(attr(RS:FindFirstChild('EggCarryConfig'), 'HoldReachLag', 0.15), 0.1, 0.5)
@@ -1723,7 +1764,7 @@ connect(RunService.Heartbeat, function(dt)
             local pos = hold.prompt.Parent and promptPosition(hold.prompt)
             local confirmed = attr(player.Character, 'CarryingEgg') == true or hub.claimCounter > hold.claimBefore
             local interrupted = not hub.config.AutoSteal or not root or not pos
-                or (root.Position - pos).Magnitude > hold.prompt.MaxActivationDistance
+                or (root.Position - pos).Magnitude > stealReach(hold.prompt)
                 or hub.stealRevision ~= hold.revision
                 or not hold.triggered and not matchesEggFilter(hold.target)
             if confirmed or interrupted then
@@ -1756,7 +1797,7 @@ connect(RunService.Heartbeat, function(dt)
                             local current = promptPosition(hold.prompt)
                             local _, _, currentRoot = body()
                             if not current or not currentRoot or not hold.prompt.Enabled
-                                or (currentRoot.Position - current).Magnitude > hold.prompt.MaxActivationDistance
+                                or (currentRoot.Position - current).Magnitude > stealReach(hold.prompt)
                                 or hub.stealRevision ~= hold.revision or not validStealTarget(hold.target) then return end
                             local success, reason = pcall(direct, hold.prompt)
                             if not success and hub.hold == hold then
@@ -1941,10 +1982,12 @@ local function loadUI()
             local pos = promptPosition(target.prompt)
             lines[#lines + 1] = 'Egg target: ' .. target.egg.Name .. ' | Rarity=' .. tostring(eggRarity(target.egg))
                 .. ' | Range=' .. tostring(target.prompt.MaxActivationDistance)
+                .. ' | Effective reach=' .. tostring(stealReach(target.prompt))
                 .. ' | Distance=' .. tostring(root and pos and math.floor((root.Position - pos).Magnitude))
                 .. ' | Approach=' .. tostring(target.approachIndex or 0) .. '/' .. tostring(target.approaches and #target.approaches or 0)
         end
         lines[#lines + 1] = 'Travel: ' .. hub.config.Travel .. ' | Owner=' .. tostring(hub.motion and hub.motion.owner)
+            .. ' | Mode=' .. tostring(hub.motion and hub.motion.mode) .. ' | Air=' .. tostring(hub.motion and hub.motion.air == true)
             .. ' | Planning=' .. tostring(hub.motion and hub.motion.planning) .. ' | Last error=' .. tostring(hub.lastTravelError)
         lines[#lines + 1] = 'Steal line: ' .. tostring(hub.stealCycle and hub.stealCycle.phase)
             .. ' | Reset required=' .. tostring(hub.stealResetRequired == true) .. ' | Attempt=' .. tostring(hub.stealAttempt or 0)
@@ -1966,7 +2009,10 @@ local function loadUI()
                 .. ' | Stage=' .. tostring(rejection.stage) .. ' | Root=' .. position(rejection.position)
                 .. ' | Egg=' .. position(rejection.target) .. ' | Safe anchor=' .. position(rejection.anchor)
                 .. ' | Native SafeZone=' .. tostring(rejection.native == true)
+                .. ' | Reach=' .. tostring(rejection.reach)
+                .. ' | Distance=' .. tostring(rejection.position and rejection.target and (rejection.position - rejection.target).Magnitude)
         end
+        lines[#lines + 1] = 'Boundary walking recoveries: ' .. tostring(hub.boundaryFallbacks or 0)
         lines[#lines + 1] = 'Egg trip: ' .. tostring(hub.stealTrip and hub.stealTrip.stage or 'select')
             .. ' | Delivery=' .. tostring(hub.stealTrip and hub.stealTrip.delivery)
             .. ' | Claims=' .. hub.stealStats.claimed .. ' | Unconfirmed carries=' .. hub.stealStats.lost
@@ -1993,6 +2039,7 @@ local function loadUI()
     changelog:Paragraph({Title = 'Safe-zone loop fix', Desc = 'Removed forced round trips. Brakes near checkpoints and ignores repeated displays of the same error.'})
     changelog:Paragraph({Title = 'Air tween', Desc = 'Auto Steal rises above the ground, flies to its target, and lands before interacting.'})
     changelog:Paragraph({Title = 'SafeZone reset', Desc = 'Returns and resets use the actual safe area. Diagnostics save where a steal was rejected.'})
+    changelog:Paragraph({Title = 'Steal reach', Desc = 'Moves closer using the game\'s configured reach. Short clear crossings can recover from failed walking paths.'})
     egg:Select()
     local lastStatus = -5
     connect(RunService.Heartbeat, function()
