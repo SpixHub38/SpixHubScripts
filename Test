@@ -89,8 +89,9 @@ local hub = {
     alive = true, connections = {}, workers = {}, modules = {}, pending = {}, statuses = {}, errors = {},
     promptDefaults = setmetatable({}, {__mode = 'k'}), collisionDefaults = setmetatable({}, {__mode = 'k'}),
     promptCooldown = setmetatable({}, {__mode = 'k'}), foodCooldown = {}, attacks = {},
-    stealStats = {native = 0, direct = 0, confirmed = 0, timeouts = 0, claimed = 0, lost = 0}, claimCounter = 0,
+    stealStats = {native = 0, direct = 0, confirmed = 0, timeouts = 0, claimed = 0, lost = 0, dropped = 0}, claimCounter = 0,
     motionFailures = {}, eggPromptWatches = setmetatable({}, {__mode = 'k'}), stealScan = {}, stealRevision = 0,
+    pendingStarterDrop = previous and previous.pendingStarterDrop or nil,
     config = {
         AutoSteal = false, AutoHatch = false, AutoPlace = false, AutoEquip = false,
         AutoCook = false, AutoEat = false, AutoSell = false, AutoPortal = false,
@@ -100,7 +101,7 @@ local hub = {
         NoClip = false, Fly = false, InfiniteJump = false, FlySpeed = 60,
         Travel = 'Tween', TravelSpeed = 600, EggRarity = previousRarity or 'All rarities', CashReserve = 0,
     },
-    build = 'egg-16', version = '1.0.0', core = Core,
+    build = 'egg-17', version = '1.0.0', core = Core,
 }
 environment.SpixAnimalEgg = hub
 local clock = os.clock
@@ -397,6 +398,8 @@ local function travel(key, destination, reach, priority, teleport, mode)
     if not root or not destination then status(key, 'Waiting for a loaded destination'); return false end
     if hub.config.Fly then status(key, 'Pause Fly to let automation travel'); return false end
     if hub.hold and key ~= 'AutoSteal' then status(key, 'Waiting for the egg interaction'); return false end
+    if key ~= 'AutoSteal' and key ~= 'AutoBoss' and hub.pendingStarterDrop
+        and hub.pendingStarterDrop.character == player.Character then status(key, 'Waiting for the starter drop'); return false end
     if key ~= 'AutoSteal' and key ~= 'AutoBoss' and hub.config.AutoSteal and hub.stealTrip
         and hub.stealTrip.stage ~= 'select' and attr(player, 'BossLoopFight') == nil then
         status(key, 'Waiting for the current egg trip'); return false
@@ -724,18 +727,21 @@ local function matchesEggFilter(target)
     if not prompt or prompt.Name ~= 'EggPrompt' or not prompt.Parent then return false end
     local egg = eggModel(prompt)
     if not egg or target.egg and target.egg ~= egg then return false end
+    local trip = hub.stealTrip
+    if trip and trip.setup and trip.target == target and trip.finalTarget
+        and trip.setupCreature == (attr(egg, 'Creature') or egg.Name) then return true end
     return hub.config.EggRarity == 'All rarities' or eggRarity(egg) == hub.config.EggRarity
 end
-local function validStealTarget(target)
+local function validStealTarget(target, anyRarity)
     local prompt = target and target.prompt
     if not prompt or prompt.Name ~= 'EggPrompt' or not prompt.Parent or not prompt:IsDescendantOf(workspace) or not prompt.Enabled
         or (hub.promptCooldown[prompt] or 0) > clock() then return false end
     local egg = eggModel(prompt)
     if not egg or attr(egg, 'HeldBy') ~= nil then return false end
-    return matchesEggFilter(target)
+    return anyRarity == true or matchesEggFilter(target)
 end
 local refreshEggPrompts
-local function stealTarget()
+local function stealTarget(anyRarity)
     local _, _, root = body()
     if not root then return nil end
     if refreshEggPrompts then refreshEggPrompts() end
@@ -748,7 +754,7 @@ local function stealTarget()
             elseif (hub.promptCooldown[prompt] or 0) > clock() then scan.cooling = scan.cooling + 1
             elseif eggModel(prompt) and attr(eggModel(prompt), 'HeldBy') == nil then scan.available = scan.available + 1 end
         end
-        if validStealTarget({prompt = prompt}) then
+        if validStealTarget({prompt = prompt}, anyRarity) then
             local egg, pos = eggModel(prompt), promptPosition(prompt)
             if egg and pos then
                 choices[#choices + 1] = {prompt = prompt, egg = egg, position = pos, distance = (root.Position - pos).Magnitude}
@@ -756,7 +762,7 @@ local function stealTarget()
             end
         end
     end
-    hub.stealScan = scan
+    if not anyRarity then hub.stealScan = scan end
     table.sort(choices, function(a, b)
         return a.distance < b.distance
     end)
@@ -848,14 +854,21 @@ local function resetStealLine(reason)
     end
     local trip = hub.stealTrip
     local delivering = rejected and trip and (trip.stage == 'return' or trip.stage == 'claim')
+    local restarting = trip and trip.finalTarget and not delivering
     releaseHold(); cancelMotion('AutoSteal')
     hub.stealTarget = nil; hub.stealCycle = nil
-    hub.stealTrip = delivering and trip or nil
+    hub.stealTrip = (delivering or restarting) and trip or nil
+    if restarting then
+        trip.target = trip.finalTarget; trip.setup = nil; trip.setupDone = nil; trip.needsSetup = true
+        trip.dropSent = nil; trip.dropConfirmedAt = nil; trip.setupConfirmed = nil
+        trip.stage = 'reset'; trip.stageAt = clock()
+        trip.creature = attr(trip.target.egg, 'Creature') or trip.target.egg.Name
+    end
     hub.lastLineNotice = tostring(reason); hub.lineNoticeAt = clock()
     hub.requiresStealLine = true
     hub.stealResetRequired = true
     hub.stealRevision = hub.stealRevision + 1
-    if delivering then trip.revision = hub.stealRevision end
+    if delivering or restarting then trip.revision = hub.stealRevision end
     hub.workers.AutoSteal.next = 0
     status('AutoSteal', delivering and 'Finishing the carried egg before resetting the line' or 'Resetting the steal line before trying again')
 end
@@ -1070,6 +1083,34 @@ local function beginTrip(target, stage)
     hub.stealTrip = trip
     return trip
 end
+local function selectStarter(trip, target)
+    local nearby = stealTarget(true)
+    local _, _, root = body()
+    local goal = promptPosition(target.prompt)
+    if nearby and root and goal and nearby.prompt ~= target.prompt and nearby.distance + 0.5 < (root.Position - goal).Magnitude then
+        trip.finalTarget = target; trip.target = nearby; trip.setup = true
+        trip.setupCreature = attr(nearby.egg, 'Creature') or nearby.egg.Name
+        trip.creature = trip.setupCreature
+        trip.dropSent = nil; trip.dropConfirmedAt = nil; trip.dropRetryAt = nil; trip.setupConfirmed = nil
+        return nearby
+    end
+    return target
+end
+local function sameCreature(expected, received)
+    if type(expected) ~= 'string' or type(received) ~= 'string' then return false end
+    local roster = moduleAt('EggRoster')
+    if roster and type(roster.canon) == 'function' then
+        local ok, a, b = pcall(function() return roster.canon(expected), roster.canon(received) end)
+        if ok then return a == b end
+    end
+    return expected == received
+end
+local function carriedCreature()
+    for _, egg in ipairs(children(workspace:FindFirstChild('CarriedEggs'))) do
+        if Core.number(attr(egg, 'HeldBy')) == player.UserId then return attr(egg, 'Creature') or egg.Name end
+    end
+    return attr(player.Character, 'CarryingCreature')
+end
 local function deliveryPoint(trip)
     local character, humanoid, root = body()
     if not root then return nil end
@@ -1130,6 +1171,43 @@ local function deliverTrip(trip)
         status('AutoSteal', 'Claim is delayed; trying your own base')
     else status('AutoSteal', 'At the claim area; waiting for the game') end
 end
+local function dropStarter(trip)
+    cancelMotion('AutoSteal')
+    if attr(player.Character, 'CarryingEgg') == true then
+        if trip.dropSent then status('AutoSteal', 'Waiting for the starter egg to drop'); return end
+        local creature = carriedCreature()
+        if not creature then status('AutoSteal', 'Waiting for the carried egg data before dropping'); return end
+        if not sameCreature(trip.setupCreature, creature) then
+            trip.setup = nil; trip.finalTarget = nil; trip.creature = creature; tripStage(trip, 'return')
+            status('AutoSteal', 'Carried egg changed; keeping it and returning'); return
+        end
+        if clock() < (trip.dropRetryAt or 0) then status('AutoSteal', 'Retrying the unavailable drop shortly'); return end
+        trip.dropRetryAt = clock() + 1
+        if fire('AutoSteal', 'EggRemotes', 'DropCarriedEgg') then
+            trip.dropSent = clock(); hub.pendingStarterDrop = {trip = trip, character = player.Character, at = clock()}
+            status('AutoSteal', 'Dropping the nearest egg before the target')
+        end
+        return
+    end
+    local receipt = hub.lastClaimedEgg
+    local claimed = hub.claimCounter > trip.claimBefore and receipt and sameCreature(trip.setupCreature, receipt.creature)
+    if not trip.dropSent and not claimed then
+        status('AutoSteal', 'Starter carry ended without a confirmed drop'); return
+    end
+    trip.dropConfirmedAt = trip.dropConfirmedAt or clock()
+    if clock() - trip.dropConfirmedAt < 0.5 then status('AutoSteal', 'Letting the starter drop register'); return end
+    if trip.dropSent then hub.stealStats.dropped = hub.stealStats.dropped + 1 end
+    trip.target = trip.finalTarget; trip.setup = nil; trip.setupDone = true
+    trip.creature = attr(trip.target.egg, 'Creature') or trip.target.egg.Name
+    trip.claimBefore = hub.claimCounter; trip.dropSent = nil; trip.dropConfirmedAt = nil
+    tripStage(trip, 'approach'); trip.target.reachAt = nil
+    hub.stealTarget = trip.target; hub.stealCycle = nil; hub.workers.AutoSteal.next = 0
+    status('AutoSteal', 'Starter released; going to the selected egg')
+end
+local function waitForPickup(trip)
+    tripStage(trip, 'pickup'); trip.pickupUntil = clock() + 3
+    status('AutoSteal', 'Waiting for the native pickup state')
+end
 newWorker('AutoSteal', 0.2, function()
     local key = 'AutoSteal'
     if not ready(key) or pausedForEvent(key) then return end
@@ -1137,13 +1215,37 @@ newWorker('AutoSteal', 0.2, function()
     local revision = hub.stealRevision
     local trip = hub.stealTrip
     if trip and trip.character ~= player.Character then abandonTrip('Character changed; starting a new trip'); trip = nil end
+    local pendingDrop = hub.pendingStarterDrop
+    if pendingDrop then
+        if pendingDrop.character ~= player.Character then hub.pendingStarterDrop = nil
+        elseif attr(player.Character, 'CarryingEgg') == true then
+            cancelMotion(key); status(key, 'Waiting for the pending starter drop'); return
+        else
+            pendingDrop.clearedAt = pendingDrop.clearedAt or clock()
+            if clock() - pendingDrop.clearedAt < 0.5 then status(key, 'Letting the starter drop register'); return end
+            if trip == pendingDrop.trip then trip.dropConfirmedAt = pendingDrop.clearedAt end
+            hub.pendingStarterDrop = nil
+        end
+    end
+    if trip and trip.setup and trip.stage == 'drop' then dropStarter(trip); return end
     if attr(player.Character, 'CarryingEgg') == true then
+        if trip and trip.setup and (trip.stage == 'hold' or trip.stage == 'pickup') then
+            trip.setupConfirmed = true; tripStage(trip, 'drop'); dropStarter(trip); return
+        end
         trip = trip or beginTrip(nil, 'return')
         tripStage(trip, 'return'); deliverTrip(trip)
         return
     end
     if trip and (trip.stage == 'return' or trip.stage == 'claim') then
         deliverTrip(trip)
+        return
+    end
+    if trip and trip.stage == 'pickup' then
+        local receipt = hub.lastClaimedEgg
+        if hub.claimCounter > trip.claimBefore and receipt and sameCreature(trip.creature, receipt.creature) then
+            tripStage(trip, trip.setup and 'drop' or 'return')
+        elseif clock() >= trip.pickupUntil then abandonTrip('Native pickup was not confirmed; restarting')
+        else status(key, 'Waiting for the native pickup state') end
         return
     end
     if hub.nextStealAt and clock() < hub.nextStealAt then
@@ -1171,9 +1273,14 @@ newWorker('AutoSteal', 0.2, function()
         end
         return
     end
-    if not trip or trip.target ~= target then trip = beginTrip(target, 'reset') end
+    if not trip or trip.target ~= target then
+        if trip and trip.setupDone then
+            trip.target = target; trip.finalTarget = target; trip.creature = attr(target.egg, 'Creature') or target.egg.Name
+        else trip = beginTrip(target, 'reset'); target = selectStarter(trip, target) end
+    end
     hub.stealTarget = target
-    if not crossStealLine(target) then tripStage(trip, 'reset'); return end
+    if not trip.setupDone and not crossStealLine(target) then tripStage(trip, 'reset'); return end
+    if trip.needsSetup then trip.needsSetup = nil; target = selectStarter(trip, target); hub.stealTarget = target end
     tripStage(trip, 'approach')
     local pos = promptPosition(target.prompt)
     if not pos then hub.stealTarget = nil; return end
@@ -1224,9 +1331,11 @@ newWorker('AutoSteal', 0.2, function()
     if connected then hold.connection = connection end
     local function recheckHeldEgg()
         if hub.hold ~= hold or hold.triggered then return end
-        if not matchesEggFilter(target) or eggModel(hold.prompt) ~= target.egg or attr(target.egg, 'HeldBy') ~= nil then
+        local holder = attr(target.egg, 'HeldBy')
+        if not matchesEggFilter(target) or eggModel(hold.prompt) ~= target.egg or holder ~= nil and Core.number(holder) ~= player.UserId then
             releaseHold(); cancelMotion(key); hub.stealTarget = nil
-            status(key, 'Egg changed; checking the selected rarity again')
+            if Core.number(holder) == player.UserId then waitForPickup(trip)
+            else status(key, 'Egg changed; checking the selected rarity again') end
         end
     end
     for _, name in ipairs({'Creature', 'Universal', 'HeldBy'}) do
@@ -1762,7 +1871,9 @@ connect(RunService.Heartbeat, function(dt)
         if hold then
             local _, _, root = body()
             local pos = hold.prompt.Parent and promptPosition(hold.prompt)
-            local confirmed = attr(player.Character, 'CarryingEgg') == true or hub.claimCounter > hold.claimBefore
+            local receipt = hub.lastClaimedEgg
+            local confirmed = attr(player.Character, 'CarryingEgg') == true or hub.claimCounter > hold.claimBefore and receipt
+                and sameCreature(attr(hold.target.egg, 'Creature') or hold.target.egg.Name, receipt.creature)
             local interrupted = not hub.config.AutoSteal or not root or not pos
                 or (root.Position - pos).Magnitude > stealReach(hold.prompt)
                 or hub.stealRevision ~= hold.revision
@@ -1776,9 +1887,12 @@ connect(RunService.Heartbeat, function(dt)
                     hub.stealCycle = nil
                     local trip = hold.trip or hub.stealTrip or beginTrip(hold.target, 'return')
                     hub.stealTrip = trip; trip.claimBefore = hold.claimBefore
-                    tripStage(trip, 'return')
+                    if trip.setup then trip.setupConfirmed = true end
+                    tripStage(trip, trip.setup and 'drop' or 'return')
                     hub.workers.AutoSteal.next = 0
-                    status('AutoSteal', 'Egg taken; returning to the claim area')
+                    status('AutoSteal', trip.setup and 'Nearest egg taken; dropping it before the target' or 'Egg taken; returning to the claim area')
+                elseif hold.trip and (hold.triggered or Core.number(attr(hold.target.egg, 'HeldBy')) == player.UserId) then
+                    waitForPickup(hold.trip)
                 else status('AutoSteal', 'Egg interaction interrupted; retrying') end
             elseif clock() >= hold.ends then
                 if hold.triggered and hold.phase ~= 'confirm' then
@@ -1913,7 +2027,7 @@ local function loadUI()
             Callback = function(value) hub:set(key, Core.clamp(value, minimum, maximum)) end})
     end
     local egg = tab('Eggs & Pets', 'egg')
-    toggle(egg, 'AutoSteal', 'Auto Steal', 'Flies above obstacles with Tween travel and lands near matching eggs.')
+    toggle(egg, 'AutoSteal', 'Auto Steal', 'Steals the nearest egg, drops it, then goes for your selected rarity.')
     local stealLabel = egg:Paragraph({Title = 'Steal status', Desc = 'Off'})
     toggle(egg, 'AutoHatch', 'Auto Hatch Eggs', 'Place bag eggs, then open them when ready.')
     toggle(egg, 'AutoPlace', 'Auto Place Eggs', 'Place bag eggs in your own yard.')
@@ -2016,6 +2130,11 @@ local function loadUI()
         lines[#lines + 1] = 'Egg trip: ' .. tostring(hub.stealTrip and hub.stealTrip.stage or 'select')
             .. ' | Delivery=' .. tostring(hub.stealTrip and hub.stealTrip.delivery)
             .. ' | Claims=' .. hub.stealStats.claimed .. ' | Unconfirmed carries=' .. hub.stealStats.lost
+            .. ' | Starter=' .. tostring(hub.stealTrip and hub.stealTrip.setup == true)
+            .. ' | Starter drops=' .. hub.stealStats.dropped .. ' | Drop pending=' .. tostring(hub.pendingStarterDrop ~= nil)
+        if hub.stealTrip and hub.stealTrip.finalTarget then
+            lines[#lines + 1] = 'Selected goal: ' .. tostring(attr(hub.stealTrip.finalTarget.egg, 'Creature') or hub.stealTrip.finalTarget.egg.Name)
+        end
         for key, value in pairs(hub.statuses) do if hub.config[key] then lines[#lines + 1] = key .. ': ' .. value end end
         for key, value in pairs(hub.errors) do lines[#lines + 1] = key .. ' error: ' .. value end
         local fn = environment.setclipboard or setclipboard
@@ -2040,6 +2159,7 @@ local function loadUI()
     changelog:Paragraph({Title = 'Air tween', Desc = 'Auto Steal rises above the ground, flies to its target, and lands before interacting.'})
     changelog:Paragraph({Title = 'SafeZone reset', Desc = 'Returns and resets use the actual safe area. Diagnostics save where a steal was rejected.'})
     changelog:Paragraph({Title = 'Steal reach', Desc = 'Moves closer using the game\'s configured reach. Short clear crossings can recover from failed walking paths.'})
+    changelog:Paragraph({Title = 'Nearest egg method', Desc = 'Picks up a nearby egg first, drops it, then collects the selected egg. Waits for the drop before moving on.'})
     egg:Select()
     local lastStatus = -5
     connect(RunService.Heartbeat, function()
