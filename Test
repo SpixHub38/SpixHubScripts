@@ -100,7 +100,7 @@ local hub = {
         NoClip = false, Fly = false, InfiniteJump = false, FlySpeed = 60,
         Travel = 'Tween', TravelSpeed = 600, EggRarity = previousRarity or 'All rarities', CashReserve = 0,
     },
-    build = 'egg-10', version = '1.0.0', core = Core,
+    build = 'egg-11', version = '1.0.0', core = Core,
 }
 environment.SpixAnimalEgg = hub
 local clock = os.clock
@@ -272,6 +272,7 @@ end
 function hub:destroy()
     if not self.alive then return end
     self.alive = false
+    if self.walkRender then pcall(RunService.UnbindFromRenderStep, RunService, self.walkRender); self.walkRender = nil end
     if self.streamThread and type(task.cancel) == 'function' then pcall(task.cancel, self.streamThread) end
     cancelMotion(); stopFly(); releaseHold(); restoreCollisions(); restorePrompts()
     if self.movementDefaults and self.movementDefaults.humanoid.Parent then
@@ -437,6 +438,7 @@ local function moveStep(dt)
         if typeof(node) ~= 'Vector3' and node.Action == Enum.PathWaypointAction.Jump then humanoid.Jump = true end
         local flat = Vector3.new(delta.X, 0, delta.Z)
         if flat.Magnitude < 2.5 and math.abs(delta.Y) < 7 then motion.index = motion.index + 1 end
+        motion.walkGoal = position
         humanoid:MoveTo(position)
     else
         local remaining = tweenSpeed(motion.owner) * math.min(math.max(dt, 0), 0.1)
@@ -473,6 +475,22 @@ local function moveStep(dt)
         hub.lastTravelError = motion.owner .. ': Movement made no progress'
         cancelMotion(); status(motion.owner, 'Movement stalled; retrying route')
     end
+end
+if type(RunService.BindToRenderStep) == 'function' then
+    local name = 'SpixEggWalking_' .. tostring(player.UserId)
+    local ok, reason = pcall(RunService.BindToRenderStep, RunService, name, Enum.RenderPriority.Character.Value + 1, function()
+        local motion = hub.motion
+        if not hub.alive or not hub.config.AutoSteal or hub.config.Fly or attr(player, 'BossLoopFight') ~= nil
+            or not motion or motion.owner ~= 'AutoSteal' or motion.mode ~= 'Walk' or motion.planning or motion.failed
+            or not motion.walkGoal or motion.character ~= player.Character or clock() - motion.touched > 2 then return end
+        local _, humanoid, root = body()
+        if not root then return end
+        local delta = motion.walkGoal - root.Position
+        local flat = Vector3.new(delta.X, 0, delta.Z)
+        local arrived = (root.Position - motion.goal).Magnitude <= (motion.reach or 2)
+        humanoid:Move(not arrived and flat.Magnitude > 0.05 and flat.Unit or Vector3.zero, false)
+    end)
+    if ok then hub.walkRender = name else hub.errors.Walking = tostring(reason) end
 end
 local function request(key, folder, name, args, callback)
     local id = folder .. '/' .. name
@@ -722,32 +740,51 @@ local function stealBoundary()
 end
 local function resetStealLine(reason)
     if not hub.alive or not hub.config.AutoSteal then return end
+    local rejected = Core.lineNotice(reason)
+    if rejected then
+        local recovery = hub.lineRecovery or {failures = 0}
+        recovery.failures = recovery.failures + 1
+        recovery.level = math.min((recovery.level or hub.lineProfileLevel or 0) + 1, 3)
+        hub.lineRecovery = recovery
+        hub.lineRejects = (hub.lineRejects or 0) + 1
+        hub.lastLineError = tostring(reason)
+    end
+    local trip = hub.stealTrip
+    local delivering = rejected and trip and (trip.stage == 'return' or trip.stage == 'claim')
     releaseHold(); cancelMotion('AutoSteal')
     hub.stealTarget = nil; hub.stealCycle = nil
-    hub.stealTrip = nil
+    hub.stealTrip = delivering and trip or nil
     hub.lastLineNotice = tostring(reason); hub.lineNoticeAt = clock()
+    hub.requiresStealLine = true
     hub.stealRevision = hub.stealRevision + 1
+    if delivering then trip.revision = hub.stealRevision end
     hub.workers.AutoSteal.next = 0
-    status('AutoSteal', 'Resetting the steal line before trying again')
+    status('AutoSteal', delivering and 'Finishing the carried egg before resetting the line' or 'Resetting the steal line before trying again')
 end
 hub.noticeWatches = setmetatable({}, {__mode = 'k'})
 local function watchNativeNotice(object)
     if not object:IsA('TextLabel') or hub.noticeWatches[object] then return end
-    local parent = object.Parent
-    local native = false
+    local parent = object
+    local native
     while parent do
-        if parent.Name == 'ErrorNotification' or parent.Name == 'UniNotification' then native = true; break end
+        if parent.Name == 'ErrorNotification' or parent.Name == 'UniNotification' then native = parent; break end
         parent = parent.Parent
     end
     if not native then return end
     hub.noticeWatches[object] = true
     local function readNotice()
-        if not hub.alive or not hub.config.AutoSteal or not object.Parent or not Core.lineNotice(object.Text) then return end
-        if clock() - (hub.lineNoticeAt or -10) < 1 then return end
+        if not hub.alive or not hub.config.AutoSteal or not object.Parent or object.Visible == false or native.Visible == false
+            or not Core.lineNotice(object.Text) then return end
+        if clock() - (hub.lineNoticeAt or -10) < 0.25 then return end
         resetStealLine(object.Text)
     end
     local changed = connect(object:GetPropertyChangedSignal('Text'), readNotice)
-    connect(object.Destroying, function() changed:Disconnect(); hub.noticeWatches[object] = nil end)
+    local visible = connect(object:GetPropertyChangedSignal('Visible'), readNotice)
+    local container = native ~= object and connect(native:GetPropertyChangedSignal('Visible'), readNotice)
+    connect(object.Destroying, function()
+        changed:Disconnect(); visible:Disconnect(); if container then container:Disconnect() end
+        hub.noticeWatches[object] = nil
+    end)
     readNotice()
 end
 local function watchPlayerGui(gui)
@@ -767,11 +804,12 @@ local function lineGround(position)
     if hit and hit.Normal.Y >= 0.6 then return hit.Position + Vector3.new(0, humanoid.HipHeight + root.Size.Y / 2, 0) end
     requestStream(position)
 end
-local function laneX(x)
+local function laneX(x, center)
     for _, area in ipairs(children(workspace:FindFirstChild('Zones'))) do
         if Core.number(attr(area, 'Zone')) == 1 or area.Name:match('^Zone1_') then
             local corridor = area:FindFirstChild('BiomePart')
             if corridor and corridor:IsA('BasePart') then
+                if center then return corridor.Position.X end
                 return Core.clamp(x, corridor.Position.X - corridor.Size.X / 2 + 8, corridor.Position.X + corridor.Size.X / 2 - 8)
             end
             break
@@ -791,43 +829,63 @@ end
 local function crossStealLine(target)
     local line, clearance = stealBoundary()
     if not line then
-        if hub.lastLineNotice then status('AutoSteal', 'Waiting for the steal-line position to load'); return false end
+        if hub.requiresStealLine or hub.lastLineNotice then status('AutoSteal', 'Waiting for the steal-line position to load'); return false end
         return true
     end
+    hub.requiresStealLine = true
     local _, _, root = body()
     if not root then return false end
     local cycle = hub.stealCycle
-    if not cycle or cycle.line ~= line or cycle.character ~= player.Character then
-        cycle = {line = line, phase = 'safe', character = player.Character, target = target}
+    if not cycle or cycle.line ~= line or cycle.clearance ~= clearance or cycle.character ~= player.Character
+        or cycle.target ~= target or cycle.trip ~= hub.stealTrip then
+        local ping = 0
+        if type(player.GetNetworkPing) == 'function' then
+            local ok, value = pcall(player.GetNetworkPing, player)
+            if ok then ping = Core.clamp(value, 0, 1) end
+        end
+        local level = math.max(hub.lineProfileLevel or 0, hub.lineRecovery and hub.lineRecovery.level or 0)
+        cycle = {line = line, clearance = clearance, phase = 'safe', character = player.Character, target = target,
+            trip = hub.stealTrip, margin = clearance + 8 + level * 8,
+            settle = Core.clamp(0.8 + ping * 2 + level * 0.5, 0.8, 3),
+            entrySettle = Core.clamp(0.4 + ping * 2, 0.4, 2)}
         hub.stealCycle = cycle
     end
-    if cycle.phase == 'ready' then return true end
+    if cycle.phase == 'ready' then
+        if root.Position.Z <= line - clearance then return true end
+        cycle.phase = 'safe'; cycle.exited = nil; cycle.walkStage = nil
+        cycle.safeAt = nil; cycle.entryAt = nil; target.reachAt = nil
+    end
     local pos = promptPosition(target.prompt)
     if not pos then return false end
-    local x = laneX(pos.X)
-    local margin = clearance + 8
+    local x = laneX(pos.X, true)
+    local margin = cycle.margin
     if cycle.phase == 'safe' then
-        if root.Position.Z < line + margin then
-            cycle.safeAt = nil
-            local safe = lineGround(Vector3.new(x, root.Position.Y, line + margin + 4))
-            local staging = lineGround(Vector3.new(x, root.Position.Y, line - margin - 4))
-            if not safe or not staging then status('AutoSteal', 'Waiting for ground beyond the steal line'); return false end
-            walkBoundary(cycle, safe, staging, 'out')
-            status('AutoSteal', 'Walking back across the steal line'); return false
+        local safe = lineGround(Vector3.new(x, root.Position.Y, line + margin + 4))
+        local staging = lineGround(Vector3.new(x, root.Position.Y, line - margin - 4))
+        if not safe or not staging then cycle.safeAt = nil; status('AutoSteal', 'Waiting for ground beyond the steal line'); return false end
+        if not cycle.exited then
+            if not walkBoundary(cycle, safe, staging, 'out') then
+                cycle.safeAt = nil; status('AutoSteal', 'Walking back across the steal line'); return false
+            end
+            cycle.exited = true
+        end
+        if root.Position.Z < line + margin or (root.Position - safe).Magnitude > 3 then
+            cycle.exited = nil; cycle.walkStage = nil; cycle.safeAt = nil
+            status('AutoSteal', 'Line position changed; repeating the outward crossing'); return false
         end
         cancelMotion('AutoSteal')
         cycle.safeAt = cycle.safeAt or clock()
-        if clock() - cycle.safeAt < 0.35 then status('AutoSteal', 'Letting the server register the line reset'); return false end
+        if clock() - cycle.safeAt < cycle.settle then status('AutoSteal', 'Settling outside the line before re-entry'); return false end
         cycle.phase = 'entry'
     end
     if cycle.phase == 'entry' then
         local entry = lineGround(Vector3.new(x, root.Position.Y, line - margin - 4))
         local staging = lineGround(Vector3.new(x, root.Position.Y, line + margin + 4))
-        if not entry or not staging then status('AutoSteal', 'Waiting for ground at the steal-line entrance'); return false end
-        if not walkBoundary(cycle, entry, staging, 'in') then status('AutoSteal', 'Walking into the egg area'); return false end
-        if root.Position.Z > line - margin then return false end
+        if not entry or not staging then cycle.entryAt = nil; status('AutoSteal', 'Waiting for ground at the steal-line entrance'); return false end
+        if not walkBoundary(cycle, entry, staging, 'in') then cycle.entryAt = nil; status('AutoSteal', 'Walking into the egg area'); return false end
+        if root.Position.Z > line - margin then cycle.entryAt = nil; return false end
         cycle.entryAt = cycle.entryAt or clock()
-        if clock() - cycle.entryAt < 0.3 then status('AutoSteal', 'Confirming entry across the steal line'); return false end
+        if clock() - cycle.entryAt < cycle.entrySettle then status('AutoSteal', 'Settling inside the egg area'); return false end
         cycle.phase = 'ready'; hub.lastLineNotice = nil
         hub.lineResets = (hub.lineResets or 0) + 1
     end
@@ -845,6 +903,8 @@ local function abandonTrip(reason)
     status('AutoSteal', reason)
 end
 local function beginTrip(target, stage)
+    hub.stealCycle = nil
+    if target then target.reachAt = nil end
     local trip = {target = target, character = player.Character, revision = hub.stealRevision, stage = stage or 'select', stageAt = clock(),
         claimBefore = hub.claimCounter, catches = Core.number(attr(player, 'GuardCatches')) or 0,
         creature = target and (attr(target.egg, 'Creature') or target.egg.Name)}
@@ -878,6 +938,8 @@ local function deliverTrip(trip)
             status('AutoSteal', 'Claim received; waiting for the carry state to clear'); return
         end
         trip.done = true; hub.stealStats.claimed = hub.stealStats.claimed + 1
+        hub.lineProfileLevel = math.max(hub.lineProfileLevel or 0, hub.lineRecovery and hub.lineRecovery.level or 0)
+        hub.lineRecovery = nil; hub.stealCycle = nil
         cancelMotion('AutoSteal'); hub.stealTrip = nil; hub.stealTarget = nil
         status('AutoSteal', 'Egg claimed; selecting the next matching egg')
         return
@@ -1678,7 +1740,7 @@ local function loadUI()
             Callback = function(value) hub:set(key, Core.clamp(value, minimum, maximum)) end})
     end
     local egg = tab('Eggs & Pets', 'egg')
-    toggle(egg, 'AutoSteal', 'Auto Steal', 'Walk the line, take a matching egg, and confirm the claim.')
+    toggle(egg, 'AutoSteal', 'Auto Steal', 'Resets the line for each egg and waits for its claim.')
     local stealLabel = egg:Paragraph({Title = 'Steal status', Desc = 'Off'})
     toggle(egg, 'AutoHatch', 'Auto Hatch Eggs', 'Place bag eggs, then open them when ready.')
     toggle(egg, 'AutoPlace', 'Auto Place Eggs', 'Place bag eggs in your own yard.')
@@ -1750,8 +1812,16 @@ local function loadUI()
         lines[#lines + 1] = 'Travel: ' .. hub.config.Travel .. ' | Owner=' .. tostring(hub.motion and hub.motion.owner)
             .. ' | Planning=' .. tostring(hub.motion and hub.motion.planning) .. ' | Last error=' .. tostring(hub.lastTravelError)
         lines[#lines + 1] = 'Steal line: ' .. tostring(hub.stealCycle and hub.stealCycle.phase)
-            .. ' | Crossings=' .. tostring(hub.lineResets or 0) .. ' | Last notice=' .. tostring(hub.lastLineNotice)
+            .. ' | Crossings=' .. tostring(hub.lineResets or 0) .. ' | Rejections=' .. tostring(hub.lineRejects or 0)
+            .. ' | Reset level=' .. tostring(hub.lineRecovery and hub.lineRecovery.level or hub.lineProfileLevel or 0)
+            .. ' | Last notice=' .. tostring(hub.lastLineError or hub.lastLineNotice)
             .. ' | Effective tween speed=' .. tostring(hub.effectiveStealSpeed)
+        local line, clearance = stealBoundary()
+        local _, _, root = body()
+        lines[#lines + 1] = 'Boundary position: line=' .. tostring(line) .. ' | Clearance=' .. tostring(clearance)
+            .. ' | Root Z=' .. tostring(root and root.Position.Z)
+            .. ' | Crossing step=' .. tostring(hub.stealCycle and hub.stealCycle.walkStage)
+            .. ' | Outside settle=' .. tostring(hub.stealCycle and hub.stealCycle.settle)
         lines[#lines + 1] = 'Egg trip: ' .. tostring(hub.stealTrip and hub.stealTrip.stage or 'select')
             .. ' | Delivery=' .. tostring(hub.stealTrip and hub.stealTrip.delivery)
             .. ' | Claims=' .. hub.stealStats.claimed .. ' | Unconfirmed carries=' .. hub.stealStats.lost
@@ -1774,6 +1844,7 @@ local function loadUI()
     changelog:Paragraph({Title = 'Faster tween', Desc = 'Faster default speed, smoother waypoint travel, and quicker returns after stealing.'})
     changelog:Paragraph({Title = 'Steal line', Desc = 'Recrosses the line after a catch or reset notice. Tween speed adapts to loaded guardians.'})
     changelog:Paragraph({Title = 'New Auto Steal', Desc = 'One egg per trip. Walks the boundary, tweens longer routes, and waits for a confirmed claim.'})
+    changelog:Paragraph({Title = 'Steal-line recovery', Desc = 'Fresh crossing for every egg. Remembers longer reset timing when the game rejects an attempt.'})
     egg:Select()
     local lastStatus = -5
     connect(RunService.Heartbeat, function()
