@@ -100,7 +100,7 @@ local hub = {
         NoClip = false, Fly = false, InfiniteJump = false, FlySpeed = 60,
         Travel = 'Tween', TravelSpeed = 600, EggRarity = previousRarity or 'All rarities', CashReserve = 0,
     },
-    build = 'egg-12', version = '1.0.0', core = Core,
+    build = 'egg-13', version = '1.0.0', core = Core,
 }
 environment.SpixAnimalEgg = hub
 local clock = os.clock
@@ -202,6 +202,7 @@ local function cancelMotion(owner)
     local motion = hub.motion
     if motion and (not owner or motion.owner == owner) then
         hub.motion = nil
+        for _, object in ipairs(motion.airObjects or {}) do pcall(function() object:Destroy() end) end
         local _, humanoid, root = body()
         if humanoid and root then pcall(function() humanoid:MoveTo(root.Position); humanoid:Move(Vector3.zero) end) end
     end
@@ -348,6 +349,49 @@ local function tweenSpeed(owner)
     hub.effectiveStealSpeed = speed
     return speed
 end
+local function airClear(from, destination, size, params)
+    if hub.config.NoClip then return true end
+    local delta = destination - from
+    if delta.Magnitude <= 0.05 then return true end
+    local count = math.max(1, math.ceil(delta.Magnitude / 400))
+    local step = delta / count
+    for index = 1, count do
+        local start = from + step * (index - 1)
+        local ok, hit = pcall(function()
+            if type(workspace.Blockcast) == 'function' then return workspace:Blockcast(CFrame.new(start), size, step, params) end
+            return workspace:Raycast(start, step, params)
+        end)
+        if not ok then return false end
+        if hit and not (index == count and step.Y < 0 and hit.Normal.Y >= 0.6
+            and (Core.number(hit.Distance) or 0) >= step.Magnitude - 0.5) then return false end
+    end
+    return true
+end
+local function airRoute(root, humanoid, destination, minimum, ceiling)
+    local params = RaycastParams.new(); params.FilterType = Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances = {player.Character}; params.RespectCanCollide = true; params.IgnoreWater = true
+    local size = Vector3.new(math.max(4, root.Size.X + 2), math.max(5, root.Size.Y + humanoid.HipHeight * 1.5), math.max(4, root.Size.Z + 2))
+    local base = math.max(root.Position.Y, destination.Y + 24, minimum or -math.huge)
+    for offset = 0, 60, 12 do
+        local height = base + offset
+        if height > (ceiling or math.huge) then break end
+        local rise = Vector3.new(root.Position.X, height, root.Position.Z)
+        local cruise = Vector3.new(destination.X, height, destination.Z)
+        if airClear(root.Position, rise, size, params) and airClear(rise, cruise, size, params)
+            and airClear(cruise, destination, size, params) then
+            return {rise, cruise, destination}, height, size, params
+        end
+    end
+end
+local function holdAir(motion, root)
+    local attachment = Instance.new('Attachment'); attachment.Name = 'SpixAirTravel'; attachment.Parent = root
+    motion.airObjects = {attachment}
+    local velocity = Instance.new('LinearVelocity'); motion.airObjects[#motion.airObjects + 1] = velocity
+    velocity.Name = 'SpixAirHover'; velocity.Attachment0 = attachment
+    velocity.RelativeTo = Enum.ActuatorRelativeTo.World; velocity.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+    velocity.VectorVelocity = Vector3.zero; velocity.ForceLimitsEnabled = false; velocity.MaxForce = math.huge
+    velocity.Parent = root
+end
 local function travel(key, destination, reach, priority, teleport, mode)
     local _, humanoid, root = body()
     if not root or not destination then status(key, 'Waiting for a loaded destination'); return false end
@@ -362,7 +406,7 @@ local function travel(key, destination, reach, priority, teleport, mode)
         status(key, 'Waiting for the current trip'); return false
     end
     local gap = (root.Position - destination).Magnitude
-    if gap <= reach then
+    if gap <= reach and (not current or not current.air or math.abs(root.Position.Y - current.goal.Y) <= 1) then
         if current and current.owner ~= key then cancelMotion() else cancelMotion(key) end
         return true
     end
@@ -376,16 +420,27 @@ local function travel(key, destination, reach, priority, teleport, mode)
         status(key, 'Arriving'); return false
     end
     if not current or current.owner ~= key or (current.goal - destination).Magnitude > 8 or current.character ~= player.Character
-        or current.mode ~= travelMode then
+        or current.mode ~= travelMode or current.air and (current.goal - destination).Magnitude > 2 then
         cancelMotion()
-        local leg = hub.config.NoClip and destination or routeLeg(player.Character, humanoid, root, destination)
+        local air = key == 'AutoSteal' and travelMode == 'Tween'
+        local leg = (air or hub.config.NoClip) and destination or routeLeg(player.Character, humanoid, root, destination)
         if not leg then status(key, 'Waiting for the next route section to load'); return false end
         current = {owner = key, goal = destination, priority = priority, touched = clock(), started = clock(),
             character = player.Character, position = root.Position, progressAt = clock(), nodes = {}, index = 1, planning = true,
-            leg = leg, mode = travelMode, reach = reach}
+            leg = leg, mode = travelMode, reach = reach, air = air}
         hub.motion = current
         humanoid.Sit = false
-        if hub.config.NoClip then current.nodes = {destination}; current.planning = false
+        if air then
+            current.airCeiling = math.max(root.Position.Y, destination.Y) + 96
+            local nodes, height, size, params = airRoute(root, humanoid, destination, nil, current.airCeiling)
+            current.planning = false
+            if nodes then
+                current.nodes = nodes; current.cruiseY = height; current.airSize = size; current.airParams = params
+                local supported, reason = pcall(holdAir, current, root)
+                if not supported then current.failed = true; current.failureReason = 'Air support unavailable: ' .. tostring(reason):sub(1, 100) end
+                requestStream(destination)
+            else current.failed = true end
+        elseif hub.config.NoClip then current.nodes = {destination}; current.planning = false
         else
             task.spawn(function()
                 local ok, nodes = pcall(function()
@@ -404,8 +459,9 @@ local function travel(key, destination, reach, priority, teleport, mode)
     end
     current.touched = clock()
     if current.failed then
-        hub.motionFailures[key] = {goal = current.goal, at = clock(), reason = 'No walking route found'}
-        hub.lastTravelError = key .. ': No walking route found'
+        local reason = current.failureReason or (current.air and 'No clear air route found' or 'No walking route found')
+        hub.motionFailures[key] = {goal = current.goal, at = clock(), reason = reason}
+        hub.lastTravelError = key .. ': ' .. reason
         cancelMotion(key); hub.workers[key].next = clock() + 2; return false
     end
     if current.planning then
@@ -415,6 +471,9 @@ local function travel(key, destination, reach, priority, teleport, mode)
             hub.lastTravelError = key .. ': Route planning timed out'
             cancelMotion(key); status(key, 'Route timed out; retrying')
         end
+    elseif current.air then
+        status(key, current.airBlocked and 'Air route blocked; checking clearance' or current.index == 1 and 'Rising above the ground'
+            or current.index == 2 and 'Flying to the target' or 'Landing near the target')
     else status(key, 'Travelling') end
     return false
 end
@@ -423,6 +482,7 @@ local function moveStep(dt)
     if not motion then return end
     local _, humanoid, root = body()
     if not root or motion.character ~= player.Character or not hub.config[motion.owner] then cancelMotion(); return end
+    if pausedForEvent(motion.owner) then cancelMotion(motion.owner); return end
     if clock() - motion.touched > 2 or hub.config.Fly then cancelMotion(); return end
     if motion.planning or motion.failed then return end
     if motion.leg and (motion.leg - motion.goal).Magnitude > 2
@@ -434,7 +494,8 @@ local function moveStep(dt)
     local node = motion.nodes[motion.index]
     if not node then node = motion.leg or motion.goal end
     local position = typeof(node) == 'Vector3' and node or node.Position
-    if (root.Position - motion.goal).Magnitude <= (motion.reach or 2) then
+    if (root.Position - motion.goal).Magnitude <= (motion.reach or 2)
+        and (not motion.air or math.abs(root.Position.Y - motion.goal.Y) <= 1) then
         cancelMotion(); hub.workers[motion.owner].next = 0; return
     end
     local delta = position - root.Position
@@ -460,6 +521,18 @@ local function moveStep(dt)
             elseif remaining <= 0 then break
             else
                 local step = math.min(offset.Magnitude, remaining)
+                if motion.air and not airClear(root.Position, root.Position + offset.Unit * step, motion.airSize, motion.airParams) then
+                    motion.airBlocked = true; motion.progressAt = clock()
+                    if clock() >= (motion.airRetryAt or 0) then
+                        motion.airRetryAt = clock() + 1
+                        local nodes, height, size, params = airRoute(root, humanoid, motion.goal, motion.cruiseY + 12, motion.airCeiling)
+                        if nodes then
+                            motion.nodes = nodes; motion.index = 1; motion.cruiseY = height
+                            motion.airSize = size; motion.airParams = params; motion.airBlocked = nil
+                        end
+                    end
+                    break
+                end
                 root.CFrame = CFrame.new(root.Position + offset.Unit * step) * root.CFrame.Rotation
                 remaining = remaining - step
                 if step >= offset.Magnitude then
@@ -692,7 +765,7 @@ local function eggApproach(target, pos)
     local character, humanoid, root = body()
     if not root then return nil end
     local range = math.max(0.5, target.prompt.MaxActivationDistance - 1)
-    if (root.Position - pos).Magnitude <= range then return root.Position end
+    if (root.Position - pos).Magnitude <= range and not (hub.motion and hub.motion.owner == 'AutoSteal' and hub.motion.air) then return root.Position end
     if target.approachOrigin and (target.approachOrigin - pos).Magnitude > 2 then
         target.approaches = nil; target.approachIndex = nil
     end
@@ -950,6 +1023,12 @@ local function deliverTrip(trip)
         if roster and type(roster.canon) == 'function' then expected = roster.canon(expected); received = roster.canon(received) end
         claimed = expected == received
     end
+    local motion = hub.motion
+    if motion and motion.owner == 'AutoSteal' and motion.air and (claimed or attr(player.Character, 'CarryingEgg') ~= true) then
+        if not travel('AutoSteal', motion.goal, 1.5, 900, false, 'Tween') then
+            status('AutoSteal', 'Finishing the landing before confirming the trip'); return
+        end
+    end
     if claimed then
         if attr(player.Character, 'CarryingEgg') == true then
             tripStage(trip, 'claim'); cancelMotion('AutoSteal')
@@ -1031,7 +1110,7 @@ newWorker('AutoSteal', 0.2, function()
     local pos = promptPosition(target.prompt)
     if not pos then hub.stealTarget = nil; return end
     local _, _, travelRoot = body()
-    if travelRoot and hub.config.Travel ~= 'Teleport' and not hub.config.NoClip and (travelRoot.Position - pos).Magnitude > 400 then
+    if travelRoot and hub.config.Travel == 'Walk' and not hub.config.NoClip and (travelRoot.Position - pos).Magnitude > 400 then
         target.reachAt = nil
         travel(key, pos, 20, 700); return
     end
@@ -1704,7 +1783,7 @@ connect(RunService.Heartbeat, function(dt)
     end)
     if not ok then hub.errors.Runtime = tostring(err); status('Runtime', 'Retrying: ' .. tostring(err):sub(1, 110)) end
 end)
-hub.test = {travel = travel, step = moveStep, pets = pets, riftState = riftState, eggInventory = eggInventory, stealTarget = stealTarget,
+hub.test = {travel = travel, step = moveStep, cancelMotion = cancelMotion, pets = pets, riftState = riftState, eggInventory = eggInventory, stealTarget = stealTarget,
     tweenSpeed = tweenSpeed, resetStealLine = resetStealLine,
     request = request, spend = spend, upgrade = upgrade, ownEggs = ownEggs, playerStep = playerStep}
 
@@ -1766,7 +1845,7 @@ local function loadUI()
             Callback = function(value) hub:set(key, Core.clamp(value, minimum, maximum)) end})
     end
     local egg = tab('Eggs & Pets', 'egg')
-    toggle(egg, 'AutoSteal', 'Auto Steal', 'Takes matching eggs. Returns to the line only when needed.')
+    toggle(egg, 'AutoSteal', 'Auto Steal', 'Flies above obstacles with Tween travel and lands near matching eggs.')
     local stealLabel = egg:Paragraph({Title = 'Steal status', Desc = 'Off'})
     toggle(egg, 'AutoHatch', 'Auto Hatch Eggs', 'Place bag eggs, then open them when ready.')
     toggle(egg, 'AutoPlace', 'Auto Place Eggs', 'Place bag eggs in your own yard.')
@@ -1873,6 +1952,7 @@ local function loadUI()
     changelog:Paragraph({Title = 'New Auto Steal', Desc = 'One egg per trip. Walks the boundary, tweens longer routes, and waits for a confirmed claim.'})
     changelog:Paragraph({Title = 'Steal-line recovery', Desc = 'Fresh crossing for every egg. Remembers longer reset timing when the game rejects an attempt.'})
     changelog:Paragraph({Title = 'Safe-zone loop fix', Desc = 'Removed forced round trips. Brakes near checkpoints and ignores repeated displays of the same error.'})
+    changelog:Paragraph({Title = 'Air tween', Desc = 'Auto Steal rises above the ground, flies to its target, and lands before interacting.'})
     egg:Select()
     local lastStatus = -5
     connect(RunService.Heartbeat, function()
