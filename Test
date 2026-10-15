@@ -100,7 +100,7 @@ local hub = {
         NoClip = false, Fly = false, InfiniteJump = false, FlySpeed = 60,
         Travel = 'Tween', TravelSpeed = 600, EggRarity = previousRarity or 'All rarities', CashReserve = 0,
     },
-    build = 'egg-13', version = '1.0.0', core = Core,
+    build = 'egg-14', version = '1.0.0', core = Core,
 }
 environment.SpixAnimalEgg = hub
 local clock = os.clock
@@ -569,6 +569,7 @@ if type(RunService.BindToRenderStep) == 'function' then
         local arrived = (root.Position - motion.goal).Magnitude <= (motion.reach or 2)
         local horizon = math.max(0.05, Core.clamp(dt, 0.016, 0.25)) * 2
         local amount = Core.clamp((flat.Magnitude - 0.25) / math.max(1, humanoid.WalkSpeed * horizon), 0, 1)
+        if motion.walkLimit then amount = math.min(amount, motion.walkLimit / math.max(1, humanoid.WalkSpeed)) end
         humanoid:Move(not arrived and flat.Magnitude > 0.05 and flat.Unit * amount or Vector3.zero, false)
     end)
     if ok then hub.walkRender = name else hub.errors.Walking = tostring(reason) end
@@ -906,17 +907,26 @@ local function walkBoundary(cycle, destination, staging, stage)
     local _, _, root = body()
     if not root then return false end
     local delta = destination - root.Position
-    if Vector3.new(delta.X, 0, delta.Z).Magnitude <= 2.5 and math.abs(delta.Y) <= 6 then
+    local motion = hub.motion
+    if Vector3.new(delta.X, 0, delta.Z).Magnitude <= 2.5 and math.abs(delta.Y) <= 6
+        and (not motion or not motion.air or math.abs(delta.Y) <= 1) then
         cancelMotion('AutoSteal'); return true
     end
     if cycle.walkStage ~= stage then
-        if delta.Magnitude > 80 then
+        if not cycle.staging and delta.Magnitude > 80 then
             local waypoint = stage == 'out' and root.Position.Z >= cycle.line and destination or staging
-            if not travel('AutoSteal', waypoint, 1.5, 700) then return false end
+            cycle.staging = {stage = stage, position = waypoint}
+        end
+        if cycle.staging then
+            if not travel('AutoSteal', cycle.staging.position, 1.5, 700) then return false end
+            cycle.staging = nil
         end
         cycle.walkStage = stage
     end
-    return travel('AutoSteal', destination, 1.5, 700, false, 'Walk')
+    local arrived = travel('AutoSteal', destination, 1.5, 700, false, 'Walk')
+    motion = hub.motion
+    if motion and motion.owner == 'AutoSteal' and motion.mode == 'Walk' then motion.walkLimit = cycle.walkLimit end
+    return arrived
 end
 local function crossStealLine(target)
     local line, clearance = stealBoundary()
@@ -925,10 +935,16 @@ local function crossStealLine(target)
         return true
     end
     hub.requiresStealLine = true
-    if not hub.stealResetRequired then return true end
     local _, _, root = body()
     if not root then return false end
+    local pos = promptPosition(target.prompt)
+    if not pos then return false end
+    local trip = hub.stealTrip
     local cycle = hub.stealCycle
+    local distant = hub.config.Travel == 'Tween' and pos.Z < line - clearance and (pos - root.Position).Magnitude > 400
+    local outbound = distant and root.Position.Z >= line - clearance
+    local crossing = cycle and cycle.trip == trip and cycle.target == target and cycle.phase ~= 'ready'
+    if not hub.stealResetRequired and not outbound and not crossing then return true end
     if not cycle or cycle.line ~= line or cycle.clearance ~= clearance or cycle.character ~= player.Character
         or cycle.target ~= target or cycle.trip ~= hub.stealTrip then
         local ping = 0
@@ -938,9 +954,9 @@ local function crossStealLine(target)
         end
         local level = math.max(hub.lineProfileLevel or 0, hub.lineRecovery and hub.lineRecovery.level or 0)
         cycle = {line = line, clearance = clearance, phase = 'safe', character = player.Character, target = target,
-            trip = hub.stealTrip, margin = clearance + 8 + level * 8,
+            trip = hub.stealTrip, margin = clearance + 8 + level * 8, walkLimit = distant and 24 or nil,
             settle = Core.clamp(0.8 + ping * 2 + level * 0.5, 0.8, 3),
-            entrySettle = Core.clamp(0.4 + ping * 2, 0.4, 2)}
+            entrySettle = Core.clamp((distant and 1.1 or 0.4) + ping * 2, 0.4, 3)}
         hub.stealCycle = cycle
     end
     if cycle.phase == 'ready' then
@@ -948,8 +964,6 @@ local function crossStealLine(target)
         cycle.phase = 'safe'; cycle.walkStage = nil
         cycle.safeAt = nil; cycle.entryAt = nil; target.reachAt = nil
     end
-    local pos = promptPosition(target.prompt)
-    if not pos then return false end
     local x = laneX(pos.X, true)
     local margin = cycle.margin
     if cycle.phase == 'safe' then
