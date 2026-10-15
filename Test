@@ -100,7 +100,7 @@ local hub = {
         NoClip = false, Fly = false, InfiniteJump = false, FlySpeed = 60,
         Travel = 'Tween', TravelSpeed = 600, EggRarity = previousRarity or 'All rarities', CashReserve = 0,
     },
-    build = 'egg-14', version = '1.0.0', core = Core,
+    build = 'egg-15', version = '1.0.0', core = Core,
 }
 environment.SpixAnimalEgg = hub
 local clock = os.clock
@@ -833,6 +833,10 @@ local function resetStealLine(reason)
         hub.lineRecovery = recovery
         hub.lineRejects = (hub.lineRejects or 0) + 1
         hub.lastLineError = tostring(reason)
+        local _, _, root = body()
+        local target = hub.stealTrip and hub.stealTrip.target or hub.stealTarget
+        hub.lastLineState = {at = clock(), position = root and root.Position, target = target and promptPosition(target.prompt),
+            stage = hub.stealTrip and hub.stealTrip.stage, anchor = hub.safeZoneAnchor, native = hub.nativeSafeZone}
     end
     local trip = hub.stealTrip
     local delivering = rejected and trip and (trip.stage == 'return' or trip.stage == 'claim')
@@ -889,6 +893,15 @@ local function lineGround(position)
     local hit = workspace:Raycast(position + Vector3.new(0, 80, 0), Vector3.new(0, -300, 0), params)
     if hit and hit.Normal.Y >= 0.6 then return hit.Position + Vector3.new(0, rootHeight(character, humanoid, root), 0) end
     requestStream(position)
+end
+local function safeLineGround(line, clearance, fallback)
+    local zone = workspace:FindFirstChild('SafeZone')
+    if zone and zone:IsA('BasePart') and zone.Position.Z >= line + clearance + 1 and math.abs(zone.Position.Z - line) <= 128 then
+        hub.safeZoneAnchor = zone.Position; hub.nativeSafeZone = true
+        return lineGround(zone.Position)
+    end
+    hub.safeZoneAnchor = fallback; hub.nativeSafeZone = false
+    return lineGround(fallback)
 end
 local function laneX(x, center)
     for _, area in ipairs(children(workspace:FindFirstChild('Zones'))) do
@@ -967,11 +980,11 @@ local function crossStealLine(target)
     local x = laneX(pos.X, true)
     local margin = cycle.margin
     if cycle.phase == 'safe' then
-        local safe = lineGround(Vector3.new(x, root.Position.Y, line + margin + 4))
+        local safe = safeLineGround(line, clearance, Vector3.new(x, root.Position.Y, line + margin + 4))
         local staging = lineGround(Vector3.new(x, root.Position.Y, line - margin - 4))
         if not safe or not staging then cycle.safeAt = nil; status('AutoSteal', 'Waiting for ground beyond the steal line'); return false end
         local gap = safe - root.Position
-        if root.Position.Z < line + margin or Vector3.new(gap.X, 0, gap.Z).Magnitude > 3 or math.abs(gap.Y) > 6 then
+        if root.Position.Z < line + clearance or Vector3.new(gap.X, 0, gap.Z).Magnitude > 3 or math.abs(gap.Y) > 6 then
             if not walkBoundary(cycle, safe, staging, 'out') then
                 cycle.safeAt = nil; status('AutoSteal', 'Walking back across the steal line'); return false
             end
@@ -983,7 +996,7 @@ local function crossStealLine(target)
     end
     if cycle.phase == 'entry' then
         local entry = lineGround(Vector3.new(x, root.Position.Y, line - margin - 4))
-        local staging = lineGround(Vector3.new(x, root.Position.Y, line + margin + 4))
+        local staging = safeLineGround(line, clearance, Vector3.new(x, root.Position.Y, line + margin + 4))
         if not entry or not staging then cycle.entryAt = nil; status('AutoSteal', 'Waiting for ground at the steal-line entrance'); return false end
         if not walkBoundary(cycle, entry, staging, 'in') then cycle.entryAt = nil; status('AutoSteal', 'Walking into the egg area'); return false end
         if root.Position.Z > line - margin then cycle.entryAt = nil; return false end
@@ -1022,7 +1035,7 @@ local function deliveryPoint(trip)
     local line, clearance = stealBoundary()
     local claimLine = Core.number(attr(RS:FindFirstChild('EggCarryConfig'), 'ClaimZ')) or line
     if claimLine and not trip.useBase then
-        return lineGround(Vector3.new(laneX(root.Position.X), root.Position.Y, claimLine + clearance + 12)), 'line'
+        return safeLineGround(claimLine, clearance, Vector3.new(laneX(root.Position.X), root.Position.Y, claimLine + clearance + 12)), 'line'
     end
     local plot = myPlot()
     local home = plot and part(plot:FindFirstChild('SpawnPoint') or plot:FindFirstChild('BaseSpawn'))
@@ -1909,6 +1922,9 @@ local function loadUI()
     local settings = tab('Settings', 'settings')
     local diagnostics = settings:Paragraph({Title = 'Status', Desc = 'Ready. Turn on a feature to begin.'})
     settings:Button({Title = 'Copy diagnostics', Callback = function()
+        local function position(value)
+            return value and string.format('%.2f, %.2f, %.2f', value.X, value.Y, value.Z) or 'none'
+        end
         local lines = {'Spix Hub ' .. hub.build, 'Version ' .. hub.version, 'Cash: ' .. tostring(money()), 'Egg bag: ' .. eggInventory(),
             'Steal input: native=' .. hub.stealStats.native .. ' direct=' .. hub.stealStats.direct .. ' confirmed=' .. hub.stealStats.confirmed .. ' timeouts=' .. hub.stealStats.timeouts}
         local scan = hub.stealScan
@@ -1942,6 +1958,15 @@ local function loadUI()
             .. ' | Root Z=' .. tostring(root and root.Position.Z)
             .. ' | Crossing step=' .. tostring(hub.stealCycle and hub.stealCycle.walkStage)
             .. ' | Outside settle=' .. tostring(hub.stealCycle and hub.stealCycle.settle)
+        lines[#lines + 1] = 'Root position: ' .. position(root and root.Position) .. ' | Safe anchor: ' .. position(hub.safeZoneAnchor)
+            .. ' | Native SafeZone=' .. tostring(hub.nativeSafeZone == true)
+        local rejection = hub.lastLineState
+        if rejection then
+            lines[#lines + 1] = 'Last rejection: ' .. string.format('%.1fs ago', clock() - rejection.at)
+                .. ' | Stage=' .. tostring(rejection.stage) .. ' | Root=' .. position(rejection.position)
+                .. ' | Egg=' .. position(rejection.target) .. ' | Safe anchor=' .. position(rejection.anchor)
+                .. ' | Native SafeZone=' .. tostring(rejection.native == true)
+        end
         lines[#lines + 1] = 'Egg trip: ' .. tostring(hub.stealTrip and hub.stealTrip.stage or 'select')
             .. ' | Delivery=' .. tostring(hub.stealTrip and hub.stealTrip.delivery)
             .. ' | Claims=' .. hub.stealStats.claimed .. ' | Unconfirmed carries=' .. hub.stealStats.lost
@@ -1967,6 +1992,7 @@ local function loadUI()
     changelog:Paragraph({Title = 'Steal-line recovery', Desc = 'Fresh crossing for every egg. Remembers longer reset timing when the game rejects an attempt.'})
     changelog:Paragraph({Title = 'Safe-zone loop fix', Desc = 'Removed forced round trips. Brakes near checkpoints and ignores repeated displays of the same error.'})
     changelog:Paragraph({Title = 'Air tween', Desc = 'Auto Steal rises above the ground, flies to its target, and lands before interacting.'})
+    changelog:Paragraph({Title = 'SafeZone reset', Desc = 'Returns and resets use the actual safe area. Diagnostics save where a steal was rejected.'})
     egg:Select()
     local lastStatus = -5
     connect(RunService.Heartbeat, function()
